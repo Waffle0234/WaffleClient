@@ -1,0 +1,1235 @@
+Kiln source bundle 5 of 6: Svelte UI: shell, routes, components, typed IPC layer, theme, config.
+Rebuild the repository by running `python3 restore.py` next to these files. Text before the first marker is ignored.
+
+<<<<<KILN-FILE ui/index.html>>>>>
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Kiln</title>
+  </head>
+  <body>
+    <div id="app"></div>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>
+
+<<<<<KILN-END>>>>>
+<<<<<KILN-FILE ui/package.json>>>>>
+{
+  "name": "kiln-ui",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "check": "svelte-check --tsconfig ./tsconfig.json",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@fontsource-variable/bricolage-grotesque": "^5.3.0",
+    "@fontsource-variable/public-sans": "^5.3.0",
+    "@tauri-apps/api": "^2.12.4"
+  },
+  "devDependencies": {
+    "@sveltejs/vite-plugin-svelte": "^7.3.1",
+    "@tailwindcss/vite": "^4.3.5",
+    "@tauri-apps/cli": "^2.12.4",
+    "@tsconfig/svelte": "^5.0.8",
+    "svelte": "^5.57.3",
+    "svelte-check": "^4.7.8",
+    "tailwindcss": "^4.3.5",
+    "typescript": "^6.0.3",
+    "vite": "^8.3.6",
+    "vitest": "^5.1.0"
+  }
+}
+
+<<<<<KILN-END>>>>>
+<<<<<KILN-FILE ui/src/App.svelte>>>>>
+<script lang="ts">
+  import { onMount } from 'svelte';
+  import Icon from './components/Icon.svelte';
+  import Placeholder from './components/Placeholder.svelte';
+  import { router } from './lib/router.svelte';
+  import { routes } from './lib/routes';
+  import { settings } from './lib/settings.svelte';
+  import Accounts from './routes/Accounts.svelte';
+  import Settings from './routes/Settings.svelte';
+
+  let main: HTMLElement | undefined = $state();
+  let firstRoute = true;
+
+  onMount(() => {
+    void settings.init();
+  });
+
+  // Move focus to the content on navigation so keyboard and screen-reader users land there.
+  $effect(() => {
+    void router.current;
+    if (firstRoute) {
+      firstRoute = false;
+      return;
+    }
+    main?.focus({ preventScroll: true });
+  });
+</script>
+
+<a
+  href="#main"
+  class="sr-only focus:not-sr-only focus:fixed focus:top-2 focus:left-2 focus:z-50 focus:rounded-md focus:bg-accent focus:px-3 focus:py-2 focus:text-on-accent"
+  onclick={(e) => {
+    e.preventDefault();
+    main?.focus();
+  }}>Skip to content</a
+>
+
+<div class="flex h-screen">
+  <nav aria-label="Main" class="flex w-56 shrink-0 flex-col border-r border-line bg-surface py-6">
+    <div class="px-6 font-display text-3xl font-semibold tracking-tight">Kiln</div>
+    <ul class="mt-8 flex flex-col gap-0.5">
+      {#each routes as r (r.id)}
+        {@const active = router.current === r.id}
+        <li>
+          <a
+            href="#/{r.id}"
+            aria-current={active ? 'page' : undefined}
+            class="flex items-center gap-3 border-l-[3px] py-2 pr-4 pl-5 transition-colors {active
+              ? 'border-accent bg-raised font-medium text-ink'
+              : 'border-transparent text-muted hover:bg-raised hover:text-ink'}"
+          >
+            <Icon name={r.icon} />
+            {r.label}
+          </a>
+        </li>
+      {/each}
+    </ul>
+  </nav>
+
+  <main id="main" tabindex="-1" bind:this={main} class="min-w-0 flex-1 overflow-y-auto px-12 py-10 outline-none">
+    {#if router.current === 'settings'}
+      <Settings />
+    {:else if settings.error && !settings.value}
+      <section class="max-w-prose">
+        <h1 class="font-display text-3xl font-semibold">Kiln couldn't start properly</h1>
+        <p role="alert" class="mt-3 text-danger">{settings.error}</p>
+        <button
+          type="button"
+          class="mt-6 cursor-pointer rounded-md bg-accent px-4 py-2 font-medium text-on-accent"
+          onclick={() => settings.init()}>Try again</button
+        >
+      </section>
+    {:else if router.current === 'home'}
+      <Placeholder
+        title="Home"
+        body="Your most recently played instances and launcher news will appear here."
+        phase={7}
+      />
+    {:else if router.current === 'instances'}
+      <Placeholder
+        title="Instances"
+        body="Create isolated profiles with their own game version, loader, mods and Java settings."
+        phase={4}
+      />
+    {:else if router.current === 'mods'}
+      <Placeholder
+        title="Mods"
+        body="Search Modrinth, install with dependencies, and update mods with one-click rollback."
+        phase={5}
+      />
+    {:else if router.current === 'accounts'}
+      <Accounts />
+    {:else if router.current === 'console'}
+      <Placeholder
+        title="Console"
+        body="Live game output and crash analysis will stream here while an instance runs."
+        phase={3}
+      />
+    {/if}
+  </main>
+</div>
+
+<<<<<KILN-END>>>>>
+<<<<<KILN-FILE ui/src/app.css>>>>>
+@import "tailwindcss";
+@import "@fontsource-variable/bricolage-grotesque";
+@import "@fontsource-variable/public-sans";
+
+@theme inline {
+  --font-display: "Bricolage Grotesque Variable", ui-sans-serif, system-ui, sans-serif;
+  --font-sans: "Public Sans Variable", ui-sans-serif, system-ui, sans-serif;
+  --color-bg: var(--bg);
+  --color-surface: var(--surface);
+  --color-raised: var(--raised);
+  --color-line: var(--line);
+  --color-ink: var(--ink);
+  --color-muted: var(--muted);
+  --color-accent: var(--accent);
+  --color-on-accent: var(--on-accent);
+  --color-danger: var(--danger);
+}
+
+/* Glaze palette. Dark is the default until the theme setting loads. */
+:root {
+  color-scheme: dark;
+  --bg: #18211f;
+  --surface: #1f2a27;
+  --raised: #283632;
+  --line: #3a4a45;
+  --ink: #e9eee8;
+  --muted: #a3b3ab;
+  --danger: #f08a7e;
+  --accent: #5fb99a;
+  --on-accent: #10201b;
+}
+:root[data-theme="light"] {
+  color-scheme: light;
+  --bg: #eef1ec;
+  --surface: #f8faf6;
+  --raised: #ffffff;
+  --line: #cfd8d1;
+  --ink: #1b2724;
+  --muted: #546761;
+  --danger: #b3382b;
+}
+
+html {
+  background: var(--bg);
+  color: var(--ink);
+  font-family: var(--font-sans);
+}
+body {
+  margin: 0;
+  background: transparent;
+}
+
+:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+/* Optional animated background: two slow glows, transform-only so it stays cheap. */
+html[data-bg="animated"] body::before {
+  content: "";
+  position: fixed;
+  inset: -20%;
+  z-index: -1;
+  pointer-events: none;
+  background:
+    radial-gradient(40% 40% at 30% 30%, color-mix(in srgb, var(--accent) 20%, transparent), transparent),
+    radial-gradient(35% 35% at 75% 70%, color-mix(in srgb, var(--accent) 11%, transparent), transparent);
+  animation: drift 40s ease-in-out infinite alternate;
+  will-change: transform;
+}
+@keyframes drift {
+  to {
+    transform: translate3d(4%, -3%, 0) scale(1.08);
+  }
+}
+
+html[data-motion="reduced"] *,
+html[data-motion="reduced"] *::before,
+html[data-motion="reduced"] *::after {
+  animation: none !important;
+  transition: none !important;
+}
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation: none !important;
+    transition: none !important;
+  }
+}
+
+/* Skin textures are pixel art: never smooth them. */
+.pixelated {
+  image-rendering: pixelated;
+}
+
+<<<<<KILN-END>>>>>
+<<<<<KILN-FILE ui/src/components/Avatar.svelte>>>>>
+<script lang="ts">
+  // Draws the player's head (face plus hat layer) straight from the 64x64 skin texture.
+  let { skinUrl, name, size = 40 }: { skinUrl: string | null; name: string; size?: number } = $props();
+
+  const scale = $derived(size / 8);
+  let failed = $state(false);
+</script>
+
+{#if skinUrl && !failed}
+  <div
+    class="relative shrink-0 overflow-hidden rounded-sm bg-raised"
+    style:width="{size}px"
+    style:height="{size}px"
+    role="img"
+    aria-label="Skin of {name}"
+  >
+    <div
+      class="pixelated absolute inset-0"
+      style:background-image="url({skinUrl})"
+      style:background-size="{64 * scale}px {64 * scale}px"
+      style:background-position="{-8 * scale}px {-8 * scale}px"
+    ></div>
+    <div
+      class="pixelated absolute inset-0"
+      style:background-image="url({skinUrl})"
+      style:background-size="{64 * scale}px {64 * scale}px"
+      style:background-position="{-40 * scale}px {-8 * scale}px"
+    ></div>
+    <!-- Detects a texture that fails to load so we can fall back to the initial. -->
+    <img class="hidden" src={skinUrl} alt="" onerror={() => (failed = true)} />
+  </div>
+{:else}
+  <div
+    class="flex shrink-0 items-center justify-center rounded-sm bg-raised font-display font-semibold text-muted"
+    style:width="{size}px"
+    style:height="{size}px"
+    aria-hidden="true"
+  >
+    {name.slice(0, 1).toUpperCase()}
+  </div>
+{/if}
+
+<<<<<KILN-END>>>>>
+<<<<<KILN-FILE ui/src/components/Icon.svelte>>>>>
+<script lang="ts">
+  type Name = 'home' | 'grid' | 'box' | 'user' | 'terminal' | 'sliders';
+  let { name, size = 20 }: { name: Name; size?: number } = $props();
+
+  const paths: Record<Name, string> = {
+    home: 'M3 11l9-8 9 8v9a1 1 0 0 1-1 1h-5v-6h-6v6H4a1 1 0 0 1-1-1z',
+    grid: 'M4 4h7v7H4zM13 4h7v7h-7zM4 13h7v7H4zM13 13h7v7h-7z',
+    box: 'M12 2l9 5v10l-9 5-9-5V7zM12 12l9-5M12 12v10M12 12L3 7',
+    user: 'M12 12a4 4 0 1 0 0-8 4 4 0 0 0 0 8zM4 21a8 8 0 0 1 16 0',
+    terminal: 'M4 5h16v14H4zM7 9l3 3-3 3M12 15h5',
+    sliders: 'M4 7h10M18 7h2M4 17h2M10 17h10M14 5v4M6 15v4',
+  };
+</script>
+
+<svg
+  width={size}
+  height={size}
+  viewBox="0 0 24 24"
+  fill="none"
+  stroke="currentColor"
+  stroke-width="1.75"
+  stroke-linecap="round"
+  stroke-linejoin="round"
+  aria-hidden="true"
+>
+  <path d={paths[name]} />
+</svg>
+
+<<<<<KILN-END>>>>>
+<<<<<KILN-FILE ui/src/components/Placeholder.svelte>>>>>
+<script lang="ts">
+  let { title, body, phase }: { title: string; body: string; phase: number } = $props();
+</script>
+
+<section class="max-w-prose">
+  <h1 class="font-display text-5xl font-semibold tracking-tight">{title}</h1>
+  <p class="mt-4 text-lg leading-relaxed text-muted">{body}</p>
+  <p class="mt-8 border-l-2 border-accent pl-4 text-sm text-muted">
+    This screen is built in Phase {phase} of the roadmap.
+  </p>
+</section>
+
+<<<<<KILN-END>>>>>
+<<<<<KILN-FILE ui/src/components/Segmented.svelte>>>>>
+<script lang="ts" generics="T extends string">
+  let {
+    options,
+    value,
+    label,
+    onchange,
+  }: {
+    options: { value: T; label: string }[];
+    value: T;
+    label: string;
+    onchange: (value: T) => void;
+  } = $props();
+
+  const name = $props.id();
+</script>
+
+<div role="radiogroup" aria-label={label} class="inline-flex rounded-md border border-line bg-surface p-0.5">
+  {#each options as option (option.value)}
+    <label class="relative">
+      <input
+        type="radio"
+        class="peer sr-only"
+        {name}
+        value={option.value}
+        checked={value === option.value}
+        onchange={() => onchange(option.value)}
+      />
+      <span
+        class="block cursor-pointer rounded-sm px-3 py-1.5 text-sm text-muted transition-colors peer-checked:bg-accent peer-checked:font-medium peer-checked:text-on-accent peer-focus-visible:outline-2 peer-focus-visible:outline-offset-2 peer-focus-visible:outline-accent"
+      >
+        {option.label}
+      </span>
+    </label>
+  {/each}
+</div>
+
+<<<<<KILN-END>>>>>
+<<<<<KILN-FILE ui/src/components/Toggle.svelte>>>>>
+<script lang="ts">
+  let {
+    checked,
+    label,
+    onchange,
+  }: { checked: boolean; label: string; onchange: (value: boolean) => void } = $props();
+</script>
+
+<button
+  type="button"
+  role="switch"
+  aria-checked={checked}
+  aria-label={label}
+  class="relative h-6 w-11 shrink-0 cursor-pointer rounded-full border border-line transition-colors {checked
+    ? 'bg-accent'
+    : 'bg-raised'}"
+  onclick={() => onchange(!checked)}
+>
+  <span
+    class="absolute top-0.5 left-0.5 size-4.5 rounded-full transition-transform {checked
+      ? 'translate-x-5 bg-on-accent'
+      : 'bg-muted'}"
+  ></span>
+</button>
+
+<<<<<KILN-END>>>>>
+<<<<<KILN-FILE ui/src/lib/accounts.svelte.ts>>>>>
+import { api, errorCode, errorMessage, type Account, type DeviceCodeInfo } from './api';
+
+export type Flow =
+  | { phase: 'idle' }
+  | { phase: 'starting' }
+  | { phase: 'waiting'; code: DeviceCodeInfo; expiresAt: number };
+
+class AccountsStore {
+  list = $state<Account[]>([]);
+  loaded = $state(false);
+  flow = $state<Flow>({ phase: 'idle' });
+  error = $state<string | null>(null);
+
+  async load(): Promise<void> {
+    try {
+      this.list = await api.authListAccounts();
+      this.error = null;
+    } catch (e) {
+      this.error = errorMessage(e);
+    } finally {
+      this.loaded = true;
+    }
+  }
+
+  /** Runs the whole device-code sign-in; resolves when it succeeds, fails or is cancelled. */
+  async signIn(): Promise<void> {
+    if (this.flow.phase !== 'idle') return;
+    this.error = null;
+    this.flow = { phase: 'starting' };
+    try {
+      const code = await api.authBeginDeviceFlow();
+      this.flow = { phase: 'waiting', code, expiresAt: Date.now() + code.expires_in * 1000 };
+      await api.authPoll();
+      await this.load();
+    } catch (e) {
+      // Cancelling is a normal outcome, not an error worth showing.
+      if (errorCode(e) !== 'auth_cancelled') this.error = errorMessage(e);
+    } finally {
+      this.flow = { phase: 'idle' };
+    }
+  }
+
+  async cancel(): Promise<void> {
+    try {
+      await api.authCancel();
+    } catch (e) {
+      this.error = errorMessage(e);
+    }
+  }
+
+  async openVerificationPage(): Promise<void> {
+    try {
+      await api.authOpenVerificationPage();
+    } catch (e) {
+      this.error = errorMessage(e);
+    }
+  }
+
+  async setActive(id: string): Promise<void> {
+    try {
+      await api.authSetActive(id);
+      await this.load();
+    } catch (e) {
+      this.error = errorMessage(e);
+    }
+  }
+
+  async remove(id: string): Promise<void> {
+    try {
+      await api.authRemove(id);
+      await this.load();
+    } catch (e) {
+      this.error = errorMessage(e);
+    }
+  }
+}
+
+export const accounts = new AccountsStore();
+
+<<<<<KILN-END>>>>>
+<<<<<KILN-FILE ui/src/lib/api.ts>>>>>
+// Typed IPC layer. Every call to the Rust backend goes through here.
+import { invoke } from '@tauri-apps/api/core';
+
+export type Theme = 'system' | 'dark' | 'light';
+
+export interface Settings {
+  theme: Theme;
+  accent_color: string;
+  animated_background: boolean;
+  reduce_motion: boolean;
+  max_concurrent_downloads: number;
+  default_ram_mb: number | null;
+  check_updates_on_start: boolean;
+  log_level: 'error' | 'warn' | 'info' | 'debug' | 'trace';
+}
+
+export interface AppInfo {
+  name: string;
+  version: string;
+  os: string;
+  arch: string;
+  portable: boolean;
+  data_dir: string;
+}
+
+export interface AppError {
+  code: string;
+  message: string;
+}
+
+export interface Account {
+  id: string;
+  username: string;
+  skin_url: string | null;
+  skin_variant: 'classic' | 'slim' | null;
+  cape_url: string | null;
+  last_used: number | null;
+  is_active: boolean;
+  /** The Microsoft sign-in expired or was revoked: sign in again. */
+  needs_reauth: boolean;
+}
+
+export interface DeviceCodeInfo {
+  user_code: string;
+  verification_uri: string;
+  expires_in: number;
+}
+
+const inTauri = typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window;
+
+async function call<T>(cmd: string, args?: Record<string, unknown>): Promise<T> {
+  if (inTauri) return invoke<T>(cmd, args);
+  if (import.meta.env.DEV) {
+    // Plain `vite dev` in a browser: use the in-memory stand-in. Stripped from production builds.
+    const { mockInvoke } = await import('./mock');
+    return mockInvoke(cmd, args) as Promise<T>;
+  }
+  throw { code: 'no_backend', message: 'Kiln must be opened through its desktop app.' } satisfies AppError;
+}
+
+/** Plain-English text for any error thrown by an IPC call. */
+export function errorMessage(e: unknown): string {
+  if (typeof e === 'object' && e !== null && 'message' in e && typeof e.message === 'string') {
+    return e.message;
+  }
+  return 'Something went wrong. Try again, and check the logs if it keeps happening.';
+}
+
+export function errorCode(e: unknown): string | null {
+  return typeof e === 'object' && e !== null && 'code' in e && typeof e.code === 'string' ? e.code : null;
+}
+
+export const api = {
+  getAppInfo: () => call<AppInfo>('get_app_info'),
+  getSettings: () => call<Settings>('get_settings'),
+  setSetting: <K extends keyof Settings>(key: K, value: Settings[K]) =>
+    call<Settings>('set_setting', { key, value }),
+
+  // Accounts. No call here ever returns a token.
+  authBeginDeviceFlow: () => call<DeviceCodeInfo>('auth_begin_device_flow'),
+  /** Resolves when the user finishes signing in; rejects with code `auth_cancelled` if cancelled. */
+  authPoll: () => call<Account>('auth_poll'),
+  authCancel: () => call<void>('auth_cancel'),
+  authOpenVerificationPage: () => call<void>('auth_open_verification_page'),
+  authListAccounts: () => call<Account[]>('auth_list_accounts'),
+  authSetActive: (id: string) => call<Account>('auth_set_active', { id }),
+  authRemove: (id: string) => call<void>('auth_remove', { id }),
+};
+
+<<<<<KILN-END>>>>>
+<<<<<KILN-FILE ui/src/lib/mock.ts>>>>>
+// Browser-only stand-in for the Rust backend, used by `npm run dev` outside Tauri.
+import type { Account, AppError, AppInfo, Settings } from './api';
+
+let settings: Settings = {
+  theme: 'system',
+  accent_color: '#5fb99a',
+  animated_background: false,
+  reduce_motion: false,
+  max_concurrent_downloads: 8,
+  default_ram_mb: null,
+  check_updates_on_start: true,
+  log_level: 'info',
+};
+
+let accounts: Account[] = [];
+let cancelPoll: (() => void) | null = null;
+
+const info: AppInfo = {
+  name: 'Kiln',
+  version: '0.1.0-dev',
+  os: 'browser',
+  arch: 'n/a',
+  portable: false,
+  data_dir: '(not available in the browser preview)',
+};
+
+export async function mockInvoke(cmd: string, args?: Record<string, unknown>): Promise<unknown> {
+  switch (cmd) {
+    case 'get_app_info':
+      return info;
+    case 'get_settings':
+      return settings;
+    case 'set_setting': {
+      const key = String(args?.key);
+      if (!(key in settings)) {
+        throw { code: 'unknown_setting', message: `Kiln has no setting called "${key}".` } satisfies AppError;
+      }
+      settings = { ...settings, [key]: args?.value };
+      return settings;
+    }
+    case 'auth_begin_device_flow':
+      return { user_code: 'DEMO1234', verification_uri: 'https://www.microsoft.com/link', expires_in: 900 };
+    case 'auth_open_verification_page':
+      return undefined;
+    case 'auth_poll':
+      return new Promise((resolve, reject) => {
+        const timer = setTimeout(() => {
+          cancelPoll = null;
+          const n = accounts.length + 1;
+          const account: Account = {
+            id: String(n).repeat(32),
+            username: `Player_${n}`,
+            skin_url: null,
+            skin_variant: null,
+            cape_url: null,
+            last_used: Date.now() / 1000,
+            is_active: true,
+            needs_reauth: false,
+          };
+          accounts = [account, ...accounts.map((a) => ({ ...a, is_active: false }))];
+          resolve(account);
+        }, 4000);
+        cancelPoll = () => {
+          clearTimeout(timer);
+          reject({ code: 'auth_cancelled', message: 'Sign-in was cancelled.' } satisfies AppError);
+        };
+      });
+    case 'auth_cancel':
+      cancelPoll?.();
+      cancelPoll = null;
+      return undefined;
+    case 'auth_list_accounts':
+      return accounts;
+    case 'auth_set_active':
+      accounts = accounts.map((a) => ({ ...a, is_active: a.id === args?.id }));
+      return accounts.find((a) => a.is_active);
+    case 'auth_remove':
+      accounts = accounts.filter((a) => a.id !== args?.id);
+      return undefined;
+    default:
+      throw { code: 'unknown_command', message: `Unknown command ${cmd}` } satisfies AppError;
+  }
+}
+
+<<<<<KILN-END>>>>>
+<<<<<KILN-FILE ui/src/lib/router.svelte.ts>>>>>
+import { parseHash, type RouteId } from './routes';
+
+class Router {
+  current = $state<RouteId>(parseHash(location.hash));
+
+  constructor() {
+    window.addEventListener('hashchange', () => {
+      this.current = parseHash(location.hash);
+    });
+  }
+}
+
+export const router = new Router();
+
+<<<<<KILN-END>>>>>
+<<<<<KILN-FILE ui/src/lib/routes.ts>>>>>
+export const routes = [
+  { id: 'home', label: 'Home', icon: 'home' },
+  { id: 'instances', label: 'Instances', icon: 'grid' },
+  { id: 'mods', label: 'Mods', icon: 'box' },
+  { id: 'accounts', label: 'Accounts', icon: 'user' },
+  { id: 'console', label: 'Console', icon: 'terminal' },
+  { id: 'settings', label: 'Settings', icon: 'sliders' },
+] as const;
+
+export type RouteId = (typeof routes)[number]['id'];
+
+/** `#/settings` -> `settings`. Unknown or empty hashes fall back to Home. */
+export function parseHash(hash: string): RouteId {
+  const id = hash.replace(/^#\/?/, '').split('/')[0];
+  return routes.find((r) => r.id === id)?.id ?? 'home';
+}
+
+<<<<<KILN-END>>>>>
+<<<<<KILN-FILE ui/src/lib/settings.svelte.ts>>>>>
+import { api, errorMessage, type AppInfo, type Settings } from './api';
+import { applyTheme } from './theme';
+
+class SettingsStore {
+  value = $state<Settings | null>(null);
+  info = $state<AppInfo | null>(null);
+  error = $state<string | null>(null);
+
+  async init(): Promise<void> {
+    try {
+      const [settings, info] = await Promise.all([api.getSettings(), api.getAppInfo()]);
+      this.value = settings;
+      this.info = info;
+      this.error = null;
+      applyTheme(settings);
+      // Follow the OS while the theme is "system".
+      window
+        .matchMedia('(prefers-color-scheme: dark)')
+        .addEventListener('change', () => this.value && applyTheme(this.value));
+    } catch (e) {
+      this.error = errorMessage(e);
+    }
+  }
+
+  async set<K extends keyof Settings>(key: K, value: Settings[K]): Promise<void> {
+    try {
+      this.value = await api.setSetting(key, value);
+      this.error = null;
+      applyTheme(this.value);
+    } catch (e) {
+      this.error = errorMessage(e);
+    }
+  }
+}
+
+export const settings = new SettingsStore();
+
+<<<<<KILN-END>>>>>
+<<<<<KILN-FILE ui/src/lib/theme.test.ts>>>>>
+import { describe, expect, it } from 'vitest';
+import { onAccent, resolveTheme } from './theme';
+import { parseHash } from './routes';
+
+describe('onAccent', () => {
+  it('uses dark text on light accents and white on dark accents', () => {
+    expect(onAccent('#5fb99a')).toBe('#10201b');
+    expect(onAccent('#ffd166')).toBe('#10201b');
+    expect(onAccent('#1d3557')).toBe('#ffffff');
+    expect(onAccent('#000000')).toBe('#ffffff');
+  });
+});
+
+describe('resolveTheme', () => {
+  it('follows the OS only for the system theme', () => {
+    expect(resolveTheme('system', true)).toBe('dark');
+    expect(resolveTheme('system', false)).toBe('light');
+    expect(resolveTheme('light', true)).toBe('light');
+    expect(resolveTheme('dark', false)).toBe('dark');
+  });
+});
+
+describe('parseHash', () => {
+  it('maps hashes to routes and falls back to home', () => {
+    expect(parseHash('#/settings')).toBe('settings');
+    expect(parseHash('#instances')).toBe('instances');
+    expect(parseHash('#/instances/abc')).toBe('instances');
+    expect(parseHash('')).toBe('home');
+    expect(parseHash('#/nope')).toBe('home');
+  });
+});
+
+<<<<<KILN-END>>>>>
+<<<<<KILN-FILE ui/src/lib/theme.ts>>>>>
+import type { Settings } from './api';
+
+function channel(v: number): number {
+  const c = v / 255;
+  return c <= 0.03928 ? c / 12.92 : ((c + 0.055) / 1.055) ** 2.4;
+}
+
+/** WCAG relative luminance of a `#rrggbb` color. */
+export function luminance(hex: string): number {
+  const n = Number.parseInt(hex.slice(1), 16);
+  return 0.2126 * channel((n >> 16) & 255) + 0.7152 * channel((n >> 8) & 255) + 0.0722 * channel(n & 255);
+}
+
+/** Text color that stays readable on top of an accent-colored fill. */
+export function onAccent(hex: string): string {
+  return luminance(hex) > 0.3 ? '#10201b' : '#ffffff';
+}
+
+export function resolveTheme(theme: Settings['theme'], prefersDark: boolean): 'dark' | 'light' {
+  return theme === 'system' ? (prefersDark ? 'dark' : 'light') : theme;
+}
+
+export function applyTheme(s: Settings): void {
+  const root = document.documentElement;
+  const prefersDark = window.matchMedia('(prefers-color-scheme: dark)').matches;
+  root.dataset.theme = resolveTheme(s.theme, prefersDark);
+  root.style.setProperty('--accent', s.accent_color);
+  root.style.setProperty('--on-accent', onAccent(s.accent_color));
+  root.dataset.motion = s.reduce_motion ? 'reduced' : 'full';
+  root.dataset.bg = s.animated_background ? 'animated' : 'plain';
+}
+
+<<<<<KILN-END>>>>>
+<<<<<KILN-FILE ui/src/main.ts>>>>>
+import './app.css';
+import { mount } from 'svelte';
+import App from './App.svelte';
+
+const target = document.getElementById('app');
+if (!target) throw new Error('Missing #app element');
+mount(App, { target });
+
+<<<<<KILN-END>>>>>
+<<<<<KILN-FILE ui/src/routes/Accounts.svelte>>>>>
+<script lang="ts">
+  import { onMount } from 'svelte';
+  import Avatar from '../components/Avatar.svelte';
+  import { accounts } from '../lib/accounts.svelte';
+
+  let now = $state(Date.now());
+  let confirmingId = $state<string | null>(null);
+  let copied = $state(false);
+
+  onMount(() => {
+    void accounts.load();
+  });
+
+  // The countdown ticks only while a sign-in code is on screen.
+  $effect(() => {
+    if (accounts.flow.phase !== 'waiting') return;
+    now = Date.now();
+    const timer = setInterval(() => (now = Date.now()), 1000);
+    return () => clearInterval(timer);
+  });
+
+  const remaining = $derived.by(() => {
+    const flow = accounts.flow;
+    if (flow.phase !== 'waiting') return '';
+    const s = Math.max(0, Math.round((flow.expiresAt - now) / 1000));
+    return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`;
+  });
+
+  async function copyCode(code: string) {
+    try {
+      await navigator.clipboard.writeText(code);
+      copied = true;
+      setTimeout(() => (copied = false), 2000);
+    } catch {
+      copied = false;
+    }
+  }
+
+  const busy = $derived(accounts.flow.phase !== 'idle');
+  const button =
+    'cursor-pointer rounded-md px-4 py-2 font-medium transition-colors disabled:cursor-not-allowed disabled:opacity-50';
+</script>
+
+<section class="max-w-3xl">
+  <div class="flex items-end justify-between gap-6">
+    <h1 class="font-display text-5xl font-semibold tracking-tight">Accounts</h1>
+    {#if accounts.list.length > 0}
+      <button
+        type="button"
+        class="{button} bg-accent text-on-accent hover:brightness-110"
+        disabled={busy}
+        onclick={() => accounts.signIn()}>Add account</button
+      >
+    {/if}
+  </div>
+
+  {#if accounts.error}
+    <p role="alert" class="mt-6 rounded-md border border-danger px-4 py-3 text-danger">
+      {accounts.error}
+    </p>
+  {/if}
+
+  {#if accounts.flow.phase === 'starting'}
+    <p class="mt-8 text-muted" role="status">Contacting Microsoft…</p>
+  {:else if accounts.flow.phase === 'waiting'}
+    {@const code = accounts.flow.code}
+    <div class="mt-8 border-y border-line py-8" role="status" aria-live="polite">
+      <p class="text-lg">Finish signing in on Microsoft's page with this code:</p>
+      <p class="mt-4 font-display text-6xl font-semibold tracking-[0.18em] select-all">{code.user_code}</p>
+      <ol class="mt-6 max-w-md list-decimal space-y-1 pl-5 text-muted">
+        <li>Open the sign-in page.</li>
+        <li>Enter the code above and sign in with the Microsoft account that owns Minecraft.</li>
+        <li>Come back here. Kiln continues on its own.</li>
+      </ol>
+      <div class="mt-6 flex flex-wrap items-center gap-3">
+        <button
+          type="button"
+          class="{button} bg-accent text-on-accent hover:brightness-110"
+          onclick={() => accounts.openVerificationPage()}>Open sign-in page</button
+        >
+        <button
+          type="button"
+          class="{button} border border-line hover:bg-raised"
+          onclick={() => copyCode(code.user_code)}>{copied ? 'Copied' : 'Copy code'}</button
+        >
+        <button type="button" class="{button} text-muted hover:text-ink" onclick={() => accounts.cancel()}
+          >Cancel</button
+        >
+        <span class="ml-auto text-sm text-muted">Code expires in {remaining}</span>
+      </div>
+      <p class="mt-4 text-sm text-muted">
+        Or go to {code.verification_uri} on any device.
+      </p>
+    </div>
+  {/if}
+
+  {#if accounts.loaded && accounts.list.length === 0 && !busy}
+    <div class="mt-10 max-w-prose">
+      <p class="text-lg leading-relaxed">
+        Add the Microsoft account that owns Minecraft: Java Edition to play online.
+      </p>
+      <p class="mt-3 text-muted">
+        Kiln never sees your password. Your sign-in is stored in your system's keychain, not in a file.
+      </p>
+      <button
+        type="button"
+        class="{button} mt-6 bg-accent text-on-accent hover:brightness-110"
+        onclick={() => accounts.signIn()}>Sign in with Microsoft</button
+      >
+    </div>
+  {:else if accounts.list.length > 0}
+    <ul class="mt-8 divide-y divide-line border-y border-line">
+      {#each accounts.list as account (account.id)}
+        <li class="flex items-center gap-4 py-4">
+          <Avatar skinUrl={account.skin_url} name={account.username} size={44} />
+          <div class="min-w-0 flex-1">
+            <div class="truncate font-medium">{account.username}</div>
+            <div class="text-sm {account.needs_reauth ? 'text-danger' : 'text-muted'}">
+              {#if account.needs_reauth}
+                Sign-in expired. Sign in again to keep using this account.
+              {:else if account.is_active}
+                In use
+              {:else}
+                Signed in
+              {/if}
+            </div>
+          </div>
+
+          {#if confirmingId === account.id}
+            <span class="text-sm text-muted">Remove this account from Kiln?</span>
+            <button
+              type="button"
+              class="{button} border border-danger text-danger hover:bg-raised"
+              onclick={async () => {
+                confirmingId = null;
+                await accounts.remove(account.id);
+              }}>Remove</button
+            >
+            <button type="button" class="{button} text-muted hover:text-ink" onclick={() => (confirmingId = null)}
+              >Keep</button
+            >
+          {:else}
+            {#if account.needs_reauth}
+              <button
+                type="button"
+                class="{button} bg-accent text-on-accent hover:brightness-110"
+                disabled={busy}
+                onclick={() => accounts.signIn()}>Sign in again</button
+              >
+            {:else if !account.is_active}
+              <button
+                type="button"
+                class="{button} border border-line hover:bg-raised"
+                onclick={() => accounts.setActive(account.id)}>Use this account</button
+              >
+            {/if}
+            <button
+              type="button"
+              class="{button} text-muted hover:text-ink"
+              aria-label="Remove {account.username}"
+              onclick={() => (confirmingId = account.id)}>Remove</button
+            >
+          {/if}
+        </li>
+      {/each}
+    </ul>
+  {/if}
+</section>
+
+<<<<<KILN-END>>>>>
+<<<<<KILN-FILE ui/src/routes/Settings.svelte>>>>>
+<script lang="ts">
+  import Segmented from '../components/Segmented.svelte';
+  import Toggle from '../components/Toggle.svelte';
+  import type { Settings } from '../lib/api';
+  import { settings } from '../lib/settings.svelte';
+
+  const glazes = [
+    { name: 'Celadon', hex: '#5fb99a' },
+    { name: 'Cobalt', hex: '#5b84e6' },
+    { name: 'Copper', hex: '#d98a56' },
+    { name: 'Plum', hex: '#b07cc6' },
+    { name: 'Ash', hex: '#9aa5a0' },
+  ];
+
+  const s = $derived(settings.value);
+
+  function readNumber(event: Event): number {
+    return Number((event.currentTarget as HTMLInputElement).valueAsNumber);
+  }
+</script>
+
+<section class="max-w-3xl">
+  <h1 class="font-display text-5xl font-semibold tracking-tight">Settings</h1>
+
+  {#if settings.error}
+    <p role="alert" class="mt-6 rounded-md border border-danger px-4 py-3 text-danger">
+      {settings.error}
+    </p>
+  {/if}
+
+  {#if s}
+    <h2 class="mt-10 font-display text-xl font-semibold">Appearance</h2>
+
+    <div class="mt-2 divide-y divide-line border-y border-line">
+      <div class="flex items-center justify-between gap-8 py-4">
+        <div>
+          <div class="font-medium">Theme</div>
+          <div class="text-sm text-muted">System follows your operating system.</div>
+        </div>
+        <Segmented
+          label="Theme"
+          value={s.theme}
+          options={[
+            { value: 'system', label: 'System' },
+            { value: 'dark', label: 'Dark' },
+            { value: 'light', label: 'Light' },
+          ]}
+          onchange={(v) => settings.set('theme', v)}
+        />
+      </div>
+
+      <div class="flex items-center justify-between gap-8 py-4">
+        <div>
+          <div class="font-medium">Accent color</div>
+          <div class="text-sm text-muted">Used for buttons, focus rings and progress.</div>
+        </div>
+        <div class="flex items-center gap-2">
+          {#each glazes as g (g.hex)}
+            <button
+              type="button"
+              class="size-7 cursor-pointer rounded-full border-2 {s.accent_color === g.hex
+                ? 'border-ink'
+                : 'border-transparent'}"
+              style:background-color={g.hex}
+              aria-label="{g.name} accent"
+              aria-pressed={s.accent_color === g.hex}
+              onclick={() => settings.set('accent_color', g.hex)}
+            ></button>
+          {/each}
+          <input
+            type="color"
+            aria-label="Custom accent color"
+            class="size-7 cursor-pointer rounded-sm border border-line bg-transparent p-0"
+            value={s.accent_color}
+            onchange={(e) => settings.set('accent_color', e.currentTarget.value)}
+          />
+        </div>
+      </div>
+
+      <div class="flex items-center justify-between gap-8 py-4">
+        <div>
+          <div class="font-medium">Animated background</div>
+          <div class="text-sm text-muted">Two slow glows behind the interface.</div>
+        </div>
+        <Toggle
+          label="Animated background"
+          checked={s.animated_background}
+          onchange={(v) => settings.set('animated_background', v)}
+        />
+      </div>
+
+      <div class="flex items-center justify-between gap-8 py-4">
+        <div>
+          <div class="font-medium">Reduce motion</div>
+          <div class="text-sm text-muted">Turns off all animation. Kiln also honors your system setting.</div>
+        </div>
+        <Toggle
+          label="Reduce motion"
+          checked={s.reduce_motion}
+          onchange={(v) => settings.set('reduce_motion', v)}
+        />
+      </div>
+    </div>
+
+    <h2 class="mt-10 font-display text-xl font-semibold">Downloads and memory</h2>
+
+    <div class="mt-2 divide-y divide-line border-y border-line">
+      <div class="flex items-center justify-between gap-8 py-4">
+        <div>
+          <label class="font-medium" for="downloads">Parallel downloads</label>
+          <div class="text-sm text-muted">From 1 to 16. Lower this on slow or metered connections.</div>
+        </div>
+        <input
+          id="downloads"
+          type="number"
+          min="1"
+          max="16"
+          class="w-20 rounded-md border border-line bg-surface px-3 py-1.5 text-right"
+          value={s.max_concurrent_downloads}
+          onchange={(e) => settings.set('max_concurrent_downloads', readNumber(e))}
+        />
+      </div>
+
+      <div class="flex items-center justify-between gap-8 py-4">
+        <div>
+          <div class="font-medium">Choose memory automatically</div>
+          <div class="text-sm text-muted">
+            Kiln picks RAM for each instance from its mods and your system.
+          </div>
+        </div>
+        <Toggle
+          label="Choose memory automatically"
+          checked={s.default_ram_mb === null}
+          onchange={(auto) => settings.set('default_ram_mb', auto ? null : 4096)}
+        />
+      </div>
+
+      {#if s.default_ram_mb !== null}
+        <div class="flex items-center justify-between gap-8 py-4">
+          <div>
+            <label class="font-medium" for="ram">Default memory (MB)</label>
+            <div class="text-sm text-muted">Instances can override this.</div>
+          </div>
+          <input
+            id="ram"
+            type="number"
+            min="512"
+            step="256"
+            class="w-28 rounded-md border border-line bg-surface px-3 py-1.5 text-right"
+            value={s.default_ram_mb}
+            onchange={(e) => settings.set('default_ram_mb', readNumber(e))}
+          />
+        </div>
+      {/if}
+    </div>
+
+    <h2 class="mt-10 font-display text-xl font-semibold">Updates and diagnostics</h2>
+
+    <div class="mt-2 divide-y divide-line border-y border-line">
+      <div class="flex items-center justify-between gap-8 py-4">
+        <div>
+          <div class="font-medium">Check for updates on start</div>
+          <div class="text-sm text-muted">Updates are signed and verified before they install.</div>
+        </div>
+        <Toggle
+          label="Check for updates on start"
+          checked={s.check_updates_on_start}
+          onchange={(v) => settings.set('check_updates_on_start', v)}
+        />
+      </div>
+
+      <div class="flex items-center justify-between gap-8 py-4">
+        <div>
+          <label class="font-medium" for="log-level">Log detail</label>
+          <div class="text-sm text-muted">
+            Logs stay on this computer and have tokens and account names removed.
+          </div>
+        </div>
+        <select
+          id="log-level"
+          class="rounded-md border border-line bg-surface px-3 py-1.5"
+          value={s.log_level}
+          onchange={(e) => settings.set('log_level', e.currentTarget.value as Settings['log_level'])}
+        >
+          {#each ['error', 'warn', 'info', 'debug', 'trace'] as level (level)}
+            <option value={level}>{level}</option>
+          {/each}
+        </select>
+      </div>
+    </div>
+
+    {#if settings.info}
+      <h2 class="mt-10 font-display text-xl font-semibold">About</h2>
+      <dl class="mt-2 grid grid-cols-[10rem_1fr] gap-y-2 border-y border-line py-4 text-sm">
+        <dt class="text-muted">Version</dt>
+        <dd>{settings.info.version}</dd>
+        <dt class="text-muted">Platform</dt>
+        <dd>{settings.info.os} ({settings.info.arch})</dd>
+        <dt class="text-muted">Data folder</dt>
+        <dd class="break-all">{settings.info.data_dir}</dd>
+        <dt class="text-muted">Portable mode</dt>
+        <dd>{settings.info.portable ? 'On' : 'Off'}</dd>
+      </dl>
+      <p class="mt-4 max-w-prose text-sm text-muted">
+        Kiln is not affiliated with Mojang or Microsoft. Minecraft is a trademark of Mojang AB.
+      </p>
+    {/if}
+  {/if}
+</section>
+
+<<<<<KILN-END>>>>>
+<<<<<KILN-FILE ui/svelte.config.js>>>>>
+import { vitePreprocess } from '@sveltejs/vite-plugin-svelte';
+
+export default { preprocess: vitePreprocess() };
+
+<<<<<KILN-END>>>>>
+<<<<<KILN-FILE ui/tsconfig.json>>>>>
+{
+  "extends": "@tsconfig/svelte/tsconfig.json",
+  "compilerOptions": {
+    "target": "ES2022",
+    "types": ["svelte", "vite/client"],
+    "strict": true,
+    "noUncheckedIndexedAccess": true,
+    "noEmit": true
+  },
+  "include": ["src/**/*.ts", "src/**/*.svelte"]
+}
+
+<<<<<KILN-END>>>>>
+<<<<<KILN-FILE ui/vite.config.ts>>>>>
+import { defineConfig } from 'vite';
+import { svelte } from '@sveltejs/vite-plugin-svelte';
+import tailwindcss from '@tailwindcss/vite';
+
+export default defineConfig({
+  plugins: [tailwindcss(), svelte()],
+  clearScreen: false,
+  server: { port: 5173, strictPort: true },
+  build: {
+    target: ['es2021', 'chrome105', 'safari15'],
+    // Never inline assets as data: URIs, so the CSP can stay `font-src 'self'`.
+    assetsInlineLimit: 0,
+  },
+});
+
+<<<<<KILN-END>>>>>

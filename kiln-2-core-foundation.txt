@@ -1,0 +1,1801 @@
+Kiln source bundle 2 of 6: kiln-core foundation: errors, paths/SafePath, hash, redaction, logging, SQLite, settings, migrations.
+Rebuild the repository by running `python3 restore.py` next to these files. Text before the first marker is ignored.
+
+<<<<<KILN-FILE crates/kiln-core/Cargo.toml>>>>>
+[package]
+name = "kiln-core"
+description = "Launcher logic for Kiln: no GUI dependencies, fully unit-testable."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+dirs.workspace = true
+hex.workspace = true
+regex.workspace = true
+reqwest.workspace = true
+rustls.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha1.workspace = true
+sha2.workspace = true
+sqlx.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-appender.workspace = true
+tracing-subscriber.workspace = true
+zeroize.workspace = true
+
+# One OS keychain backend per platform. Refresh tokens live only here.
+[target.'cfg(target_os = "windows")'.dependencies]
+keyring = { version = "3", features = ["windows-native"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+keyring = { version = "3", features = ["apple-native"] }
+
+[target.'cfg(any(target_os = "linux", target_os = "freebsd"))'.dependencies]
+keyring = { version = "3", features = ["sync-secret-service", "crypto-rust"] }
+
+[dev-dependencies]
+tempfile.workspace = true
+wiremock.workspace = true
+
+<<<<<KILN-END>>>>>
+<<<<<KILN-FILE crates/kiln-core/build.rs>>>>>
+// Re-run the build when migrations change so `sqlx::migrate!` embeds the latest set.
+fn main() {
+    println!("cargo:rerun-if-changed=migrations");
+}
+
+<<<<<KILN-END>>>>>
+<<<<<KILN-FILE crates/kiln-core/migrations/0001_init.sql>>>>>
+-- Kiln schema v1.
+-- Timestamps are unix seconds (UTC). Booleans are 0/1.
+-- No secrets live here: refresh tokens are kept only in the OS keychain.
+
+CREATE TABLE settings (
+    key   TEXT PRIMARY KEY NOT NULL,
+    value TEXT NOT NULL CHECK (json_valid(value))
+) STRICT;
+
+CREATE TABLE accounts (
+    id        TEXT PRIMARY KEY NOT NULL,
+    username  TEXT NOT NULL,
+    skin_hash TEXT,
+    last_used INTEGER,
+    is_active INTEGER NOT NULL DEFAULT 0 CHECK (is_active IN (0, 1))
+) STRICT;
+-- At most one active account.
+CREATE UNIQUE INDEX accounts_one_active ON accounts (is_active) WHERE is_active = 1;
+
+CREATE TABLE java_runtimes (
+    id      TEXT PRIMARY KEY NOT NULL,
+    vendor  TEXT NOT NULL,
+    major   INTEGER NOT NULL CHECK (major > 0),
+    path    TEXT NOT NULL UNIQUE,
+    managed INTEGER NOT NULL DEFAULT 0 CHECK (managed IN (0, 1))
+) STRICT;
+
+CREATE TABLE instances (
+    id             TEXT PRIMARY KEY NOT NULL,
+    name           TEXT NOT NULL,
+    mc_version     TEXT NOT NULL,
+    loader         TEXT NOT NULL DEFAULT 'vanilla'
+                   CHECK (loader IN ('vanilla', 'fabric', 'quilt', 'neoforge', 'forge')),
+    loader_version TEXT,
+    java_id        TEXT REFERENCES java_runtimes (id) ON DELETE SET NULL,
+    jvm_args       TEXT,
+    ram_mb         INTEGER CHECK (ram_mb IS NULL OR ram_mb > 0),
+    perf_preset    TEXT NOT NULL DEFAULT 'off',
+    created_at     INTEGER NOT NULL,
+    last_played    INTEGER,
+    playtime_s     INTEGER NOT NULL DEFAULT 0 CHECK (playtime_s >= 0),
+    -- Directory name relative to the instances folder (keeps portable mode relocatable).
+    dir            TEXT NOT NULL UNIQUE
+) STRICT;
+
+CREATE TABLE mods (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    instance_id TEXT NOT NULL REFERENCES instances (id) ON DELETE CASCADE,
+    file_name   TEXT NOT NULL,
+    sha1        TEXT NOT NULL,
+    sha512      TEXT,
+    source      TEXT NOT NULL DEFAULT 'unverified' CHECK (source IN ('modrinth', 'unverified')),
+    project_id  TEXT,
+    version_id  TEXT,
+    pinned      INTEGER NOT NULL DEFAULT 0 CHECK (pinned IN (0, 1)),
+    enabled     INTEGER NOT NULL DEFAULT 1 CHECK (enabled IN (0, 1)),
+    UNIQUE (instance_id, file_name)
+) STRICT;
+CREATE INDEX mods_by_sha1 ON mods (sha1);
+
+CREATE TABLE mod_backups (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    instance_id TEXT NOT NULL REFERENCES instances (id) ON DELETE CASCADE,
+    mod_id      INTEGER REFERENCES mods (id) ON DELETE SET NULL,
+    file_path   TEXT NOT NULL,
+    replaced_at INTEGER NOT NULL,
+    reason      TEXT NOT NULL
+) STRICT;
+CREATE INDEX mod_backups_by_instance ON mod_backups (instance_id);
+
+CREATE TABLE servers (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    instance_id TEXT NOT NULL REFERENCES instances (id) ON DELETE CASCADE,
+    name        TEXT NOT NULL,
+    address     TEXT NOT NULL,
+    favorite    INTEGER NOT NULL DEFAULT 0 CHECK (favorite IN (0, 1))
+) STRICT;
+CREATE INDEX servers_by_instance ON servers (instance_id);
+
+CREATE TABLE backups (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    instance_id TEXT NOT NULL REFERENCES instances (id) ON DELETE CASCADE,
+    world       TEXT NOT NULL,
+    path        TEXT NOT NULL,
+    created_at  INTEGER NOT NULL,
+    size        INTEGER NOT NULL CHECK (size >= 0)
+) STRICT;
+CREATE INDEX backups_by_instance ON backups (instance_id);
+
+CREATE TABLE option_profiles (
+    id   TEXT PRIMARY KEY NOT NULL,
+    name TEXT NOT NULL,
+    kind TEXT NOT NULL CHECK (kind IN ('keybinds', 'options')),
+    data TEXT NOT NULL CHECK (json_valid(data))
+) STRICT;
+
+CREATE TABLE http_cache (
+    url        TEXT PRIMARY KEY NOT NULL,
+    etag       TEXT,
+    body_path  TEXT NOT NULL,
+    fetched_at INTEGER NOT NULL
+) STRICT;
+
+<<<<<KILN-END>>>>>
+<<<<<KILN-FILE crates/kiln-core/migrations/0002_account_profile.sql>>>>>
+-- Account profile details shown in the UI, plus a flag for accounts whose Microsoft
+-- sign-in was revoked or expired and must be redone. Still no secrets here.
+ALTER TABLE accounts ADD COLUMN skin_variant TEXT CHECK (skin_variant IN ('classic', 'slim'));
+ALTER TABLE accounts ADD COLUMN cape_hash TEXT;
+ALTER TABLE accounts ADD COLUMN needs_reauth INTEGER NOT NULL DEFAULT 0 CHECK (needs_reauth IN (0, 1));
+
+<<<<<KILN-END>>>>>
+<<<<<KILN-FILE crates/kiln-core/src/db/mod.rs>>>>>
+//! SQLite access: WAL mode, foreign keys on, migrations applied at open.
+//! Queries use sqlx's runtime API (no compile-time database needed); migrations are
+//! embedded at compile time.
+
+use std::path::Path;
+use std::str::FromStr;
+use std::time::Duration;
+
+use sqlx::migrate::Migrator;
+use sqlx::sqlite::{
+    SqliteConnectOptions, SqliteJournalMode, SqlitePool, SqlitePoolOptions, SqliteSynchronous,
+};
+
+use crate::Result;
+
+pub type Db = SqlitePool;
+
+static MIGRATOR: Migrator = sqlx::migrate!("./migrations");
+
+/// Open (creating if needed) the database at `path` and apply pending migrations.
+pub async fn open(path: &Path) -> Result<Db> {
+    let options = SqliteConnectOptions::new()
+        .filename(path)
+        .create_if_missing(true)
+        .journal_mode(SqliteJournalMode::Wal)
+        .synchronous(SqliteSynchronous::Normal)
+        .foreign_keys(true)
+        .busy_timeout(Duration::from_secs(5));
+    let pool = SqlitePoolOptions::new()
+        .max_connections(4)
+        .acquire_timeout(Duration::from_secs(5))
+        .connect_with(options)
+        .await?;
+    MIGRATOR.run(&pool).await?;
+    tracing::debug!("database ready");
+    Ok(pool)
+}
+
+/// In-memory database for tests. A single never-expiring connection, because every new
+/// connection to `:memory:` would otherwise be its own empty database.
+pub async fn open_in_memory() -> Result<Db> {
+    let options = SqliteConnectOptions::from_str("sqlite::memory:")?.foreign_keys(true);
+    let pool = SqlitePoolOptions::new()
+        .max_connections(1)
+        .idle_timeout(None)
+        .max_lifetime(None)
+        .connect_with(options)
+        .await?;
+    MIGRATOR.run(&pool).await?;
+    Ok(pool)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    async fn insert_instance(db: &Db, id: &str) {
+        sqlx::query(
+            "INSERT INTO instances (id, name, mc_version, created_at, dir) VALUES (?1, ?1, '1.21.1', 0, ?1)",
+        )
+        .bind(id)
+        .execute(db)
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn migrations_create_every_table() {
+        let db = open_in_memory().await.unwrap();
+        let names: Vec<(String,)> = sqlx::query_as(
+            "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE '\\_%' ESCAPE '\\' AND name NOT LIKE 'sqlite_%' ORDER BY name",
+        )
+        .fetch_all(&db)
+        .await
+        .unwrap();
+        let names: Vec<&str> = names.iter().map(|(n,)| n.as_str()).collect();
+        for expected in [
+            "accounts",
+            "backups",
+            "http_cache",
+            "instances",
+            "java_runtimes",
+            "mod_backups",
+            "mods",
+            "option_profiles",
+            "servers",
+            "settings",
+        ] {
+            assert!(names.contains(&expected), "missing {expected}: {names:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn file_database_uses_wal_and_reopens_cleanly() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("k.sqlite");
+        let db = open(&path).await.unwrap();
+        let (mode,): (String,) = sqlx::query_as("PRAGMA journal_mode")
+            .fetch_one(&db)
+            .await
+            .unwrap();
+        assert_eq!(mode, "wal");
+        insert_instance(&db, "a").await;
+        db.close().await;
+
+        // Re-opening re-runs the migrator: must be a no-op and keep data.
+        let db = open(&path).await.unwrap();
+        let (n,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM instances")
+            .fetch_one(&db)
+            .await
+            .unwrap();
+        assert_eq!(n, 1);
+    }
+
+    #[tokio::test]
+    async fn deleting_an_instance_cascades() {
+        let db = open_in_memory().await.unwrap();
+        insert_instance(&db, "a").await;
+        sqlx::query("INSERT INTO mods (instance_id, file_name, sha1) VALUES ('a', 'x.jar', 'h')")
+            .execute(&db)
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM instances WHERE id = 'a'")
+            .execute(&db)
+            .await
+            .unwrap();
+        let (n,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM mods")
+            .fetch_one(&db)
+            .await
+            .unwrap();
+        assert_eq!(n, 0);
+    }
+
+    #[tokio::test]
+    async fn only_one_account_can_be_active() {
+        let db = open_in_memory().await.unwrap();
+        let insert = |id: &'static str, active: i64| {
+            let db = db.clone();
+            async move {
+                sqlx::query("INSERT INTO accounts (id, username, is_active) VALUES (?1, ?1, ?2)")
+                    .bind(id)
+                    .bind(active)
+                    .execute(&db)
+                    .await
+            }
+        };
+        insert("a", 1).await.unwrap();
+        insert("b", 0).await.unwrap();
+        assert!(insert("c", 1).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn constraints_reject_bad_data() {
+        let db = open_in_memory().await.unwrap();
+        // Unknown loader.
+        let bad_loader = sqlx::query(
+            "INSERT INTO instances (id, name, mc_version, loader, created_at, dir) VALUES ('x','x','1.21','optifine',0,'x')",
+        )
+        .execute(&db)
+        .await;
+        assert!(bad_loader.is_err());
+        // Invalid JSON in settings.
+        let bad_json = sqlx::query("INSERT INTO settings (key, value) VALUES ('k', '{not json')")
+            .execute(&db)
+            .await;
+        assert!(bad_json.is_err());
+        // Foreign key to a missing instance.
+        let orphan =
+            sqlx::query("INSERT INTO mods (instance_id, file_name, sha1) VALUES ('nope','x','h')")
+                .execute(&db)
+                .await;
+        assert!(orphan.is_err());
+    }
+}
+
+<<<<<KILN-END>>>>>
+<<<<<KILN-FILE crates/kiln-core/src/error.rs>>>>>
+//! Error types. [`Error`] carries technical detail (logged, redacted);
+//! [`AppError`] is what crosses the IPC boundary: a stable code and a plain-English message.
+
+use serde::Serialize;
+
+use crate::auth::AuthError;
+
+pub type Result<T> = std::result::Result<T, Error>;
+
+#[derive(Debug, thiserror::Error)]
+pub enum Error {
+    #[error("path rejected: {0}")]
+    InvalidPath(String),
+    #[error("hash mismatch: expected {expected}, got {actual}")]
+    HashMismatch { expected: String, actual: String },
+    #[error("invalid hash: {0}")]
+    InvalidHash(String),
+    #[error("unknown setting: {0}")]
+    UnknownSetting(String),
+    #[error("invalid value for setting {key}: {reason}")]
+    InvalidSetting { key: String, reason: String },
+    #[error("database error: {0}")]
+    Database(#[from] sqlx::Error),
+    #[error("database migration failed: {0}")]
+    Migration(#[from] sqlx::migrate::MigrateError),
+    #[error("I/O error: {0}")]
+    Io(#[from] std::io::Error),
+    #[error("JSON error: {0}")]
+    Json(#[from] serde_json::Error),
+    #[error("logging setup failed: {0}")]
+    Logging(String),
+    #[error("network error: {0}")]
+    Http(String),
+    #[error("connection blocked by host policy: {0}")]
+    HostNotAllowed(String),
+    #[error("keychain error: {0}")]
+    Keychain(String),
+    #[error(transparent)]
+    Auth(#[from] AuthError),
+}
+
+impl Error {
+    /// Stable machine-readable code for the UI.
+    pub fn code(&self) -> &'static str {
+        match self {
+            Self::InvalidPath(_) => "invalid_path",
+            Self::HashMismatch { .. } => "hash_mismatch",
+            Self::InvalidHash(_) => "invalid_hash",
+            Self::UnknownSetting(_) => "unknown_setting",
+            Self::InvalidSetting { .. } => "invalid_setting",
+            Self::Database(_) => "database",
+            Self::Migration(_) => "migration",
+            Self::Io(_) => "io",
+            Self::Json(_) => "json",
+            Self::Logging(_) => "logging",
+            Self::Http(_) => "network",
+            Self::HostNotAllowed(_) => "host_not_allowed",
+            Self::Keychain(_) => "keychain",
+            Self::Auth(e) => e.code(),
+        }
+    }
+
+    /// Plain-English message for the user. Never includes file paths, which can contain
+    /// the person's account name.
+    pub fn user_message(&self) -> String {
+        match self {
+            Self::InvalidPath(_) => {
+                "That file path isn't allowed because it points outside Kiln's folders.".into()
+            }
+            Self::HashMismatch { .. } => "A downloaded file didn't match its expected checksum, \
+                so Kiln discarded it. Try again. If it keeps happening, check your network \
+                connection and antivirus."
+                .into(),
+            Self::InvalidHash(_) => "Kiln was given a checksum it couldn't understand.".into(),
+            Self::UnknownSetting(key) => format!("Kiln has no setting called \"{key}\"."),
+            Self::InvalidSetting { key, reason } => {
+                format!("\"{key}\" can't be set to that value: {reason}.")
+            }
+            Self::Database(_) => "Kiln couldn't read or write its database. Make sure its data \
+                folder is writable and the disk isn't full, then restart Kiln."
+                .into(),
+            Self::Migration(_) => "Kiln couldn't upgrade its database. Restart Kiln. If this \
+                repeats, restore the data folder from a backup."
+                .into(),
+            Self::Io(_) => {
+                "Kiln couldn't access a file or folder. Check permissions and free disk space."
+                    .into()
+            }
+            Self::Json(_) => "Kiln found data it couldn't understand.".into(),
+            Self::Logging(_) => "Kiln couldn't set up its log files.".into(),
+            Self::Http(_) => "Kiln couldn't reach the server. Check your internet connection \
+                and try again."
+                .into(),
+            Self::HostNotAllowed(_) => {
+                "Kiln refused to connect to an address it doesn't trust.".into()
+            }
+            Self::Keychain(_) => {
+                if cfg!(target_os = "linux") {
+                    "Kiln couldn't use your system keychain to store your sign-in. Install and \
+                     unlock a Secret Service provider such as GNOME Keyring or KWallet, then try \
+                     again."
+                        .into()
+                } else {
+                    "Kiln couldn't use your system keychain to store your sign-in. Make sure it \
+                     is unlocked and available, then try again."
+                        .into()
+                }
+            }
+            Self::Auth(e) => e.user_message(),
+        }
+    }
+}
+
+/// Serializable error returned from every IPC command.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct AppError {
+    pub code: &'static str,
+    pub message: String,
+}
+
+impl From<Error> for AppError {
+    fn from(e: Error) -> Self {
+        // Technical detail goes to the (redacting) log, not to the UI.
+        tracing::error!(error = %e, code = e.code(), "command failed");
+        Self {
+            code: e.code(),
+            message: e.user_message(),
+        }
+    }
+}
+
+<<<<<KILN-END>>>>>
+<<<<<KILN-FILE crates/kiln-core/src/hash.rs>>>>>
+//! Streaming SHA-1/SHA-256/SHA-512 hashing and verification.
+//! Mojang manifests use SHA-1, Modrinth uses SHA-1 and SHA-512, Adoptium uses SHA-256.
+
+use std::io::Read;
+use std::path::Path;
+
+use serde::{Deserialize, Serialize};
+use sha1::Sha1;
+use sha2::{Digest, Sha256, Sha512};
+
+use crate::{Error, Result};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum HashAlgo {
+    Sha1,
+    Sha256,
+    Sha512,
+}
+
+impl HashAlgo {
+    pub const fn hex_len(self) -> usize {
+        match self {
+            Self::Sha1 => 40,
+            Self::Sha256 => 64,
+            Self::Sha512 => 128,
+        }
+    }
+}
+
+/// A validated, lowercase hex digest together with its algorithm.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExpectedHash {
+    algo: HashAlgo,
+    hex: String,
+}
+
+impl ExpectedHash {
+    pub fn new(algo: HashAlgo, hex: &str) -> Result<Self> {
+        let hex = hex.trim();
+        if hex.len() != algo.hex_len() || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Err(Error::InvalidHash(format!(
+                "expected {} hex characters for {algo:?}",
+                algo.hex_len()
+            )));
+        }
+        Ok(Self {
+            algo,
+            hex: hex.to_ascii_lowercase(),
+        })
+    }
+
+    pub fn algo(&self) -> HashAlgo {
+        self.algo
+    }
+
+    pub fn hex(&self) -> &str {
+        &self.hex
+    }
+}
+
+enum Inner {
+    Sha1(Sha1),
+    Sha256(Sha256),
+    Sha512(Sha512),
+}
+
+/// Incremental hasher, so the downloader can hash while it writes.
+pub struct StreamHasher(Inner);
+
+impl std::fmt::Debug for StreamHasher {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("StreamHasher(..)")
+    }
+}
+
+impl StreamHasher {
+    pub fn new(algo: HashAlgo) -> Self {
+        Self(match algo {
+            HashAlgo::Sha1 => Inner::Sha1(Sha1::new()),
+            HashAlgo::Sha256 => Inner::Sha256(Sha256::new()),
+            HashAlgo::Sha512 => Inner::Sha512(Sha512::new()),
+        })
+    }
+
+    pub fn update(&mut self, data: &[u8]) {
+        match &mut self.0 {
+            Inner::Sha1(h) => Digest::update(h, data),
+            Inner::Sha256(h) => Digest::update(h, data),
+            Inner::Sha512(h) => Digest::update(h, data),
+        }
+    }
+
+    /// Lowercase hex digest.
+    pub fn finalize_hex(self) -> String {
+        match self.0 {
+            Inner::Sha1(h) => hex::encode(h.finalize()),
+            Inner::Sha256(h) => hex::encode(h.finalize()),
+            Inner::Sha512(h) => hex::encode(h.finalize()),
+        }
+    }
+}
+
+pub fn hash_bytes(algo: HashAlgo, data: &[u8]) -> String {
+    let mut h = StreamHasher::new(algo);
+    h.update(data);
+    h.finalize_hex()
+}
+
+pub fn hash_reader(algo: HashAlgo, mut reader: impl Read) -> Result<String> {
+    let mut hasher = StreamHasher::new(algo);
+    let mut buf = vec![0u8; 64 * 1024];
+    loop {
+        let n = reader.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    Ok(hasher.finalize_hex())
+}
+
+/// Hash a file on the blocking pool so the async runtime stays responsive.
+pub async fn hash_file(algo: HashAlgo, path: &Path) -> Result<String> {
+    let path = path.to_path_buf();
+    tokio::task::spawn_blocking(move || hash_reader(algo, std::fs::File::open(path)?))
+        .await
+        .map_err(|e| Error::Io(std::io::Error::other(e)))?
+}
+
+/// Verify a file against an expected digest; a mismatch is an error.
+pub async fn verify_file(path: &Path, expected: &ExpectedHash) -> Result<()> {
+    let actual = hash_file(expected.algo, path).await?;
+    if actual == expected.hex {
+        Ok(())
+    } else {
+        Err(Error::HashMismatch {
+            expected: expected.hex.clone(),
+            actual,
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const SHA1_ABC: &str = "a9993e364706816aba3e25717850c26c9cd0d89d";
+    const SHA256_ABC: &str = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
+    const SHA512_ABC: &str = "ddaf35a193617abacc417349ae20413112e6fa4e89a97ea20a9eeee64b55d39a\
+2192992a274fc1a836ba3c23a3feebbd454d4423643ce80e2a9ac94fa54ca49f";
+    const SHA256_EMPTY: &str = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+
+    #[test]
+    fn known_vectors() {
+        assert_eq!(hash_bytes(HashAlgo::Sha1, b"abc"), SHA1_ABC);
+        assert_eq!(hash_bytes(HashAlgo::Sha256, b"abc"), SHA256_ABC);
+        assert_eq!(hash_bytes(HashAlgo::Sha512, b"abc"), SHA512_ABC);
+        assert_eq!(hash_bytes(HashAlgo::Sha256, b""), SHA256_EMPTY);
+    }
+
+    #[test]
+    fn streaming_matches_one_shot() {
+        let mut h = StreamHasher::new(HashAlgo::Sha256);
+        h.update(b"a");
+        h.update(b"bc");
+        assert_eq!(h.finalize_hex(), SHA256_ABC);
+    }
+
+    #[test]
+    fn reader_spanning_multiple_buffers() {
+        let data = vec![7u8; 200_000];
+        let via_reader = hash_reader(HashAlgo::Sha1, &data[..]).unwrap();
+        assert_eq!(via_reader, hash_bytes(HashAlgo::Sha1, &data));
+    }
+
+    #[test]
+    fn expected_hash_validates_and_normalizes() {
+        let h = ExpectedHash::new(HashAlgo::Sha1, &SHA1_ABC.to_uppercase()).unwrap();
+        assert_eq!(h.hex(), SHA1_ABC);
+        assert!(ExpectedHash::new(HashAlgo::Sha1, "abc").is_err());
+        assert!(ExpectedHash::new(HashAlgo::Sha1, &"z".repeat(40)).is_err());
+        // Right characters, wrong algorithm length.
+        assert!(ExpectedHash::new(HashAlgo::Sha256, SHA1_ABC).is_err());
+    }
+
+    #[tokio::test]
+    async fn verify_file_accepts_match_and_rejects_mismatch() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("f.bin");
+        std::fs::write(&path, b"abc").unwrap();
+
+        let good = ExpectedHash::new(HashAlgo::Sha256, SHA256_ABC).unwrap();
+        verify_file(&path, &good).await.unwrap();
+
+        let bad = ExpectedHash::new(HashAlgo::Sha256, SHA256_EMPTY).unwrap();
+        let err = verify_file(&path, &bad).await.unwrap_err();
+        assert!(matches!(err, Error::HashMismatch { .. }));
+    }
+
+    #[tokio::test]
+    async fn verify_missing_file_is_io_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let h = ExpectedHash::new(HashAlgo::Sha1, SHA1_ABC).unwrap();
+        let err = verify_file(&dir.path().join("nope"), &h).await.unwrap_err();
+        assert!(matches!(err, Error::Io(_)));
+    }
+}
+
+<<<<<KILN-END>>>>>
+<<<<<KILN-FILE crates/kiln-core/src/lib.rs>>>>>
+//! Kiln core: all launcher logic, with no GUI dependencies so it can be unit-tested
+//! on its own. The Tauri shell (`src-tauri`) only validates input and calls into here.
+
+pub mod auth;
+pub mod db;
+pub mod error;
+pub mod hash;
+pub mod logging;
+pub mod net;
+pub mod paths;
+pub mod redact;
+pub mod settings;
+
+pub use error::{AppError, Error, Result};
+
+/// Display name. Kept in one place so the codename is easy to change.
+pub const APP_NAME: &str = "Kiln";
+/// Version of the core crate (the workspace version).
+pub const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
+
+<<<<<KILN-END>>>>>
+<<<<<KILN-FILE crates/kiln-core/src/logging.rs>>>>>
+//! `tracing` setup: rolling daily log files, optional stderr, and a writer that passes
+//! every formatted event through the redactor before it is written anywhere.
+
+use std::io::{self, Write};
+use std::path::Path;
+
+use tracing::Metadata;
+use tracing_appender::non_blocking::WorkerGuard;
+use tracing_appender::rolling::{RollingFileAppender, Rotation};
+use tracing_subscriber::fmt::MakeWriter;
+use tracing_subscriber::layer::SubscriberExt;
+use tracing_subscriber::util::SubscriberInitExt;
+use tracing_subscriber::{fmt, reload, EnvFilter, Registry};
+
+use crate::{redact, Error, Result};
+
+pub const LOG_LEVELS: &[&str] = &["error", "warn", "info", "debug", "trace"];
+const KEEP_LOG_FILES: usize = 7;
+
+/// Buffers one event and writes it, redacted, on flush or drop, so a secret can't be
+/// split across two `write` calls and slip past the patterns.
+pub struct RedactingWriter<W: Write> {
+    inner: W,
+    buf: Vec<u8>,
+}
+
+impl<W: Write> RedactingWriter<W> {
+    pub fn new(inner: W) -> Self {
+        Self {
+            inner,
+            buf: Vec::new(),
+        }
+    }
+
+    fn flush_buf(&mut self) -> io::Result<()> {
+        if self.buf.is_empty() {
+            return Ok(());
+        }
+        let text = String::from_utf8_lossy(&self.buf);
+        let redacted = redact::global().redact(&text);
+        let result = self.inner.write_all(redacted.as_bytes());
+        self.buf.clear();
+        result
+    }
+}
+
+impl<W: Write> Write for RedactingWriter<W> {
+    fn write(&mut self, data: &[u8]) -> io::Result<usize> {
+        self.buf.extend_from_slice(data);
+        Ok(data.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.flush_buf()?;
+        self.inner.flush()
+    }
+}
+
+impl<W: Write> Drop for RedactingWriter<W> {
+    fn drop(&mut self) {
+        // Nowhere to report a failed log write from a destructor.
+        let _ = self.flush_buf();
+    }
+}
+
+pub struct RedactingMakeWriter<M>(pub M);
+
+impl<'a, M: MakeWriter<'a>> MakeWriter<'a> for RedactingMakeWriter<M> {
+    type Writer = RedactingWriter<M::Writer>;
+
+    fn make_writer(&'a self) -> Self::Writer {
+        RedactingWriter::new(self.0.make_writer())
+    }
+
+    fn make_writer_for(&'a self, meta: &Metadata<'_>) -> Self::Writer {
+        RedactingWriter::new(self.0.make_writer_for(meta))
+    }
+}
+
+/// Keep alive for the life of the app: dropping it flushes pending log lines.
+pub struct LogGuard {
+    _worker: WorkerGuard,
+    level: reload::Handle<EnvFilter, Registry>,
+    env_override: bool,
+}
+
+impl std::fmt::Debug for LogGuard {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("LogGuard(..)")
+    }
+}
+
+fn parse_filter(level: &str) -> Result<EnvFilter> {
+    if !LOG_LEVELS.contains(&level) {
+        return Err(Error::Logging(format!("unknown log level {level:?}")));
+    }
+    // sqlx logs every statement at info; keep it quiet unless the user asks for more.
+    EnvFilter::try_new(format!("{level},sqlx=warn")).map_err(|e| Error::Logging(e.to_string()))
+}
+
+impl LogGuard {
+    /// Change the log level at runtime. Ignored when `KILN_LOG` is set, so a developer's
+    /// explicit filter always wins.
+    pub fn set_level(&self, level: &str) -> Result<()> {
+        if self.env_override {
+            return Ok(());
+        }
+        let filter = parse_filter(level)?;
+        self.level
+            .reload(filter)
+            .map_err(|e| Error::Logging(e.to_string()))
+    }
+}
+
+/// Install the global subscriber. Can only succeed once per process.
+pub fn init(log_dir: &Path, level: &str, also_stderr: bool) -> Result<LogGuard> {
+    let appender = RollingFileAppender::builder()
+        .rotation(Rotation::DAILY)
+        .filename_prefix("kiln")
+        .filename_suffix("log")
+        .max_log_files(KEEP_LOG_FILES)
+        .build(log_dir)
+        .map_err(|e| Error::Logging(e.to_string()))?;
+    let (non_blocking, worker) = tracing_appender::non_blocking(appender);
+
+    let (filter, env_override) = match std::env::var("KILN_LOG") {
+        Ok(spec) => (
+            EnvFilter::try_new(spec).map_err(|e| Error::Logging(e.to_string()))?,
+            true,
+        ),
+        Err(_) => (parse_filter(level)?, false),
+    };
+    let (filter_layer, level_handle) = reload::Layer::new(filter);
+
+    let file_layer = fmt::layer()
+        .with_ansi(false)
+        .with_writer(RedactingMakeWriter(non_blocking));
+    let stderr_layer =
+        also_stderr.then(|| fmt::layer().with_writer(RedactingMakeWriter(io::stderr)));
+
+    tracing_subscriber::registry()
+        .with(filter_layer)
+        .with(file_layer)
+        .with(stderr_layer)
+        .try_init()
+        .map_err(|e| Error::Logging(e.to_string()))?;
+
+    Ok(LogGuard {
+        _worker: worker,
+        level: level_handle,
+        env_override,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{Arc, Mutex};
+
+    use super::*;
+
+    #[derive(Clone, Default)]
+    struct Shared(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for Shared {
+        fn write(&mut self, data: &[u8]) -> io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(data);
+            Ok(data.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> MakeWriter<'a> for Shared {
+        type Writer = Shared;
+        fn make_writer(&'a self) -> Shared {
+            self.clone()
+        }
+    }
+
+    #[test]
+    fn events_are_redacted_before_they_are_written() {
+        let sink = Shared::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_writer(RedactingMakeWriter(sink.clone()))
+            .finish();
+
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::info!(
+                "refresh_token=M.R3_BAY.SECRETVALUE and --accessToken tok123 for /home/alex/x"
+            );
+        });
+
+        let out = String::from_utf8(sink.0.lock().unwrap().clone()).unwrap();
+        assert!(out.contains("[REDACTED]"), "{out}");
+        for leaked in ["SECRETVALUE", "tok123", "alex"] {
+            assert!(!out.contains(leaked), "leaked {leaked}: {out}");
+        }
+    }
+
+    #[test]
+    fn rejects_unknown_levels() {
+        assert!(parse_filter("info").is_ok());
+        assert!(parse_filter("verbose").is_err());
+        assert!(parse_filter("info,secret=trace").is_err());
+    }
+}
+
+<<<<<KILN-END>>>>>
+<<<<<KILN-FILE crates/kiln-core/src/paths.rs>>>>>
+//! Data directory layout, portable mode, and [`SafePath`], the only way file operations
+//! on untrusted relative paths (archive entries, modpack files, IPC input) are allowed.
+
+use std::path::{Path, PathBuf};
+
+use crate::{Error, Result};
+
+/// If a file or folder with this name sits next to the executable, Kiln runs in portable
+/// mode and keeps all data beside the app.
+pub const PORTABLE_MARKER: &str = "kiln-portable";
+const PORTABLE_DATA_DIR: &str = "kiln-data";
+
+#[derive(Debug, Clone)]
+pub struct DataDirs {
+    pub root: PathBuf,
+    pub db_file: PathBuf,
+    pub logs: PathBuf,
+    pub cache: PathBuf,
+    pub instances: PathBuf,
+    pub java: PathBuf,
+    pub backups: PathBuf,
+    pub portable: bool,
+}
+
+impl DataDirs {
+    pub fn from_root(root: impl Into<PathBuf>, portable: bool) -> Self {
+        let root = root.into();
+        Self {
+            db_file: root.join("kiln.sqlite"),
+            logs: root.join("logs"),
+            cache: root.join("cache"),
+            instances: root.join("instances"),
+            java: root.join("java"),
+            backups: root.join("backups"),
+            root,
+            portable,
+        }
+    }
+
+    /// Portable if the marker exists next to the executable, otherwise the platform data dir.
+    pub fn resolve(exe_dir: Option<&Path>) -> Result<Self> {
+        if let Some(dir) = exe_dir {
+            if dir.join(PORTABLE_MARKER).exists() {
+                return Ok(Self::from_root(dir.join(PORTABLE_DATA_DIR), true));
+            }
+        }
+        let base = dirs::data_dir().ok_or_else(|| {
+            Error::Io(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "no platform data directory",
+            ))
+        })?;
+        Ok(Self::from_root(base.join("Kiln"), false))
+    }
+
+    /// Create every directory. On Unix the root is made private to the current user.
+    pub fn ensure_created(&self) -> Result<()> {
+        for dir in [
+            &self.root,
+            &self.logs,
+            &self.cache,
+            &self.instances,
+            &self.java,
+            &self.backups,
+        ] {
+            std::fs::create_dir_all(dir)?;
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&self.root, std::fs::Permissions::from_mode(0o700))?;
+        }
+        Ok(())
+    }
+}
+
+const RESERVED_NAMES: &[&str] = &[
+    "CON", "PRN", "AUX", "NUL", "CONIN$", "CONOUT$", "COM1", "COM2", "COM3", "COM4", "COM5",
+    "COM6", "COM7", "COM8", "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8",
+    "LPT9",
+];
+
+fn reject(rel: &str, why: &str) -> Error {
+    Error::InvalidPath(format!("{why}: {rel:?}"))
+}
+
+fn is_reserved(component: &str) -> bool {
+    let stem = component.split('.').next().unwrap_or(component).trim_end();
+    RESERVED_NAMES.iter().any(|r| r.eq_ignore_ascii_case(stem))
+}
+
+fn validate_component(rel: &str, c: &str) -> Result<()> {
+    if c == ".." {
+        return Err(reject(rel, "parent directory reference"));
+    }
+    if c.len() > 255 {
+        return Err(reject(rel, "name too long"));
+    }
+    // `:` also blocks Windows drive prefixes and NTFS alternate data streams.
+    if c.chars()
+        .any(|ch| ch.is_control() || matches!(ch, '<' | '>' | ':' | '"' | '|' | '?' | '*'))
+    {
+        return Err(reject(rel, "illegal character"));
+    }
+    if c.ends_with('.') || c.ends_with(' ') {
+        return Err(reject(rel, "trailing dot or space"));
+    }
+    if is_reserved(c) {
+        return Err(reject(rel, "reserved device name"));
+    }
+    Ok(())
+}
+
+/// Lexically validate a relative path. Both `/` and `\` separate components, so an archive
+/// built on Windows can't smuggle `..\` past a Unix check (or vice versa). The rules are
+/// the strictest of all platforms so instances stay portable between them.
+pub fn validate_relative(rel: &str) -> Result<Vec<&str>> {
+    if rel.starts_with('/') || rel.starts_with('\\') {
+        return Err(reject(rel, "absolute path"));
+    }
+    let parts: Vec<&str> = rel
+        .split(['/', '\\'])
+        .filter(|c| !c.is_empty() && *c != ".")
+        .collect();
+    if parts.is_empty() {
+        return Err(reject(rel, "empty path"));
+    }
+    for c in &parts {
+        validate_component(rel, c)?;
+    }
+    Ok(parts)
+}
+
+/// A path proven to stay inside a root directory, including after resolving symlinks in
+/// any part of it that already exists.
+///
+/// Note: this is a check at construction time. A hostile process that can already write
+/// inside the root could still race it, which is outside Kiln's threat model (it would
+/// already be running as the user).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SafePath {
+    root: PathBuf,
+    full: PathBuf,
+}
+
+impl SafePath {
+    pub fn new(root: &Path, rel: &str) -> Result<Self> {
+        let parts = validate_relative(rel)?;
+        let root = root.canonicalize()?;
+        let mut full = root.clone();
+        full.extend(parts);
+        ensure_inside(&root, &full, rel)?;
+        Ok(Self { root, full })
+    }
+
+    pub fn as_path(&self) -> &Path {
+        &self.full
+    }
+
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
+    /// Path relative to the root.
+    pub fn relative(&self) -> &Path {
+        self.full.strip_prefix(&self.root).unwrap_or(&self.full)
+    }
+}
+
+impl AsRef<Path> for SafePath {
+    fn as_ref(&self) -> &Path {
+        &self.full
+    }
+}
+
+fn ensure_inside(root: &Path, full: &Path, rel: &str) -> Result<()> {
+    // Resolve the deepest part that exists; anything below it can't be a symlink yet.
+    let mut probe = full;
+    while probe.symlink_metadata().is_err() {
+        match probe.parent() {
+            Some(parent) if parent.starts_with(root) => probe = parent,
+            _ => return Err(reject(rel, "escapes the root directory")),
+        }
+    }
+    let resolved = probe
+        .canonicalize()
+        .map_err(|_| reject(rel, "could not be resolved"))?;
+    if resolved.starts_with(root) {
+        Ok(())
+    } else {
+        Err(reject(rel, "escapes the root directory"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn root() -> tempfile::TempDir {
+        tempfile::tempdir().unwrap()
+    }
+
+    #[test]
+    fn accepts_plain_and_nested_paths_that_do_not_exist_yet() {
+        let dir = root();
+        let p = SafePath::new(dir.path(), "mods/sodium-0.6.jar").unwrap();
+        assert!(p.as_path().starts_with(p.root()));
+        assert_eq!(p.relative(), Path::new("mods").join("sodium-0.6.jar"));
+    }
+
+    #[test]
+    fn normalizes_separators_and_dots() {
+        let dir = root();
+        let a = SafePath::new(dir.path(), "a\\.\\b//c").unwrap();
+        let b = SafePath::new(dir.path(), "a/b/c").unwrap();
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn rejects_traversal_and_absolute_paths() {
+        let dir = root();
+        for bad in [
+            "../x",
+            "a/../../x",
+            "a/..",
+            "..\\x",
+            "a\\..\\..\\x",
+            "/etc/passwd",
+            "\\\\server\\share",
+            "C:\\Windows\\x",
+            "C:/x",
+            "",
+            ".",
+            "./",
+        ] {
+            assert!(SafePath::new(dir.path(), bad).is_err(), "accepted {bad:?}");
+        }
+    }
+
+    #[test]
+    fn parent_references_are_rejected_by_the_explicit_rule() {
+        // `..` is also caught by the trailing-dot rule; assert the reason so each layer
+        // stays independently covered.
+        for bad in ["..", "a/../b", "a\\..\\b"] {
+            let err = validate_relative(bad).unwrap_err().to_string();
+            assert!(err.contains("parent directory"), "{bad:?}: {err}");
+        }
+    }
+
+    #[test]
+    fn rejects_windows_hazards() {
+        let dir = root();
+        let long = "a".repeat(256);
+        for bad in [
+            "a/CON",
+            "aux.txt",
+            "nul",
+            "Com1.log",
+            "LPT9",
+            "a/b.",
+            "a/b ",
+            "evil|name",
+            "what?",
+            "file.txt:stream",
+            "a\0b",
+            "tab\tname",
+            long.as_str(),
+        ] {
+            assert!(SafePath::new(dir.path(), bad).is_err(), "accepted {bad:?}");
+        }
+        // Names that merely contain a reserved word are fine.
+        assert!(SafePath::new(dir.path(), "console.txt").is_ok());
+    }
+
+    #[test]
+    fn missing_root_is_an_error() {
+        let dir = root();
+        assert!(SafePath::new(&dir.path().join("missing"), "a").is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_symlink_escape_but_allows_internal_symlinks() {
+        use std::os::unix::fs::symlink;
+        let dir = root();
+        let outside = root();
+        symlink(outside.path(), dir.path().join("escape")).unwrap();
+        std::fs::create_dir(dir.path().join("real")).unwrap();
+        symlink(dir.path().join("real"), dir.path().join("inside")).unwrap();
+
+        assert!(SafePath::new(dir.path(), "escape").is_err());
+        assert!(SafePath::new(dir.path(), "escape/new/file").is_err());
+        assert!(SafePath::new(dir.path(), "inside/file").is_ok());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_dangling_symlink() {
+        use std::os::unix::fs::symlink;
+        let dir = root();
+        symlink("/nonexistent-target", dir.path().join("dangling")).unwrap();
+        assert!(SafePath::new(dir.path(), "dangling").is_err());
+    }
+
+    #[test]
+    fn portable_marker_switches_layout() {
+        let exe = root();
+        let normal = DataDirs::resolve(Some(exe.path())).unwrap();
+        assert!(!normal.portable);
+
+        std::fs::write(exe.path().join(PORTABLE_MARKER), b"").unwrap();
+        let portable = DataDirs::resolve(Some(exe.path())).unwrap();
+        assert!(portable.portable);
+        assert_eq!(portable.root, exe.path().join(PORTABLE_DATA_DIR));
+    }
+
+    #[test]
+    fn ensure_created_makes_the_tree() {
+        let base = root();
+        let dirs = DataDirs::from_root(base.path().join("data"), false);
+        dirs.ensure_created().unwrap();
+        for d in [
+            &dirs.logs,
+            &dirs.cache,
+            &dirs.instances,
+            &dirs.java,
+            &dirs.backups,
+        ] {
+            assert!(d.is_dir());
+        }
+        assert_eq!(dirs.db_file, dirs.root.join("kiln.sqlite"));
+    }
+}
+
+<<<<<KILN-END>>>>>
+<<<<<KILN-FILE crates/kiln-core/src/redact.rs>>>>>
+//! Scrubs secrets and personal data from text before it reaches a log or crash report:
+//! bearer/JWT tokens, token-like key/value pairs, Minecraft launch credentials, e-mail
+//! addresses, OS account names inside paths, and any value registered at runtime
+//! (for example the active Minecraft username).
+
+use std::borrow::Cow;
+use std::sync::{LazyLock, RwLock};
+
+use regex::Regex;
+
+pub const MASK: &str = "[REDACTED]";
+/// Registered values at least this long are matched without word boundaries.
+const LONG_SECRET: usize = 12;
+/// Upper bound on dynamically registered secrets.
+const MAX_SECRETS: usize = 64;
+
+pub struct Redactor {
+    rules: Vec<(Regex, &'static str)>,
+    secrets: RwLock<Vec<Regex>>,
+}
+
+impl std::fmt::Debug for Redactor {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Redactor(..)")
+    }
+}
+
+#[allow(clippy::expect_used)] // Static, test-covered patterns: failing here is a programmer error.
+fn rule(pattern: &str, replacement: &'static str) -> (Regex, &'static str) {
+    (
+        Regex::new(pattern).expect("built-in redaction pattern must compile"),
+        replacement,
+    )
+}
+
+impl Default for Redactor {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Redactor {
+    pub fn new() -> Self {
+        let rules = vec![
+            // `Authorization: Bearer abc.def`
+            rule(r"(?i)\b(bearer)\s+[A-Za-z0-9\-._~+/]+=*", "$1 [REDACTED]"),
+            // Bare JWTs (Microsoft and Minecraft tokens).
+            rule(
+                r"\beyJ[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]*",
+                MASK,
+            ),
+            // Game launch arguments that carry credentials or identity.
+            rule(
+                r"(?i)(--(?:username|uuid|accessToken|xuid|clientId|session|userProperties)(?:\s+|=))\S+",
+                "${1}[REDACTED]",
+            ),
+            // `refresh_token=...`, `"access_token": "..."`, `password: ...`
+            rule(
+                r#"(?i)(["']?\b(?:access_token|refresh_token|id_token|client_secret|device_code|user_code|password|token|xsts_token|xbl_token|mc_token|uhs|userhash)\b["']?\s*[:=]\s*["']?)([^"'&\s,}]+)"#,
+                "${1}[REDACTED]",
+            ),
+            // E-mail addresses (Microsoft account names).
+            rule(
+                r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}",
+                "[REDACTED-EMAIL]",
+            ),
+            // OS account names inside home-directory paths (also JSON-escaped `\\`).
+            rule(
+                r#"(?i)(/home/|/Users/|[A-Z]:\\{1,2}Users\\{1,2})[^/\\\s"']+"#,
+                "${1}<user>",
+            ),
+        ];
+        Self {
+            rules,
+            secrets: RwLock::new(Vec::new()),
+        }
+    }
+
+    /// Register a literal value to be masked everywhere from now on.
+    ///
+    /// Short values (usernames) are matched case-insensitively as whole words; long values
+    /// (tokens, at least [`LONG_SECRET`] characters) are matched anywhere, because tokens
+    /// contain punctuation that breaks word boundaries. Values shorter than three
+    /// characters are ignored to avoid mangling ordinary text. Only the newest
+    /// [`MAX_SECRETS`] are kept so a long session can't grow this without bound.
+    pub fn register_secret(&self, value: &str) {
+        let value = value.trim();
+        if value.chars().count() < 3 {
+            return;
+        }
+        let pattern = if value.chars().count() >= LONG_SECRET {
+            regex::escape(value)
+        } else {
+            format!(r"(?i)\b{}\b", regex::escape(value))
+        };
+        if let Ok(re) = Regex::new(&pattern) {
+            let mut secrets = self.secrets.write().unwrap_or_else(|e| e.into_inner());
+            if secrets.len() >= MAX_SECRETS {
+                secrets.remove(0);
+            }
+            secrets.push(re);
+        }
+    }
+
+    pub fn redact<'a>(&self, input: &'a str) -> Cow<'a, str> {
+        let mut out = Cow::Borrowed(input);
+        for re in self
+            .secrets
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+        {
+            if re.is_match(&out) {
+                out = Cow::Owned(re.replace_all(&out, MASK).into_owned());
+            }
+        }
+        for (re, replacement) in &self.rules {
+            if re.is_match(&out) {
+                out = Cow::Owned(re.replace_all(&out, *replacement).into_owned());
+            }
+        }
+        out
+    }
+}
+
+/// Process-wide redactor used by the logging layer.
+pub fn global() -> &'static Redactor {
+    static GLOBAL: LazyLock<Redactor> = LazyLock::new(Redactor::new);
+    &GLOBAL
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn r(s: &str) -> String {
+        Redactor::new().redact(s).into_owned()
+    }
+
+    #[test]
+    fn bearer_and_jwt() {
+        assert_eq!(
+            r("Authorization: Bearer abc.DEF-123_x=="),
+            "Authorization: Bearer [REDACTED]"
+        );
+        let jwt = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0In0.c2lnbmF0dXJl";
+        let out = r(&format!("token was {jwt} ok"));
+        assert!(!out.contains("eyJ"), "{out}");
+    }
+
+    #[test]
+    fn launch_arguments() {
+        let out = r(
+            "java -cp x Main --username Steve --uuid 069a79f4 --accessToken abc.def --version 1.21",
+        );
+        assert!(!out.contains("Steve") && !out.contains("069a79f4") && !out.contains("abc.def"));
+        assert!(out.contains("--version 1.21"));
+    }
+
+    #[test]
+    fn key_value_forms() {
+        let out = r(r#"{"refresh_token":"M.R3_BAY.secret","expires_in":3600}"#);
+        assert!(!out.contains("M.R3_BAY"), "{out}");
+        assert!(out.contains("expires_in"));
+        let out = r("https://x/cb?access_token=SECRET&state=ok");
+        assert!(!out.contains("SECRET") && out.contains("state=ok"), "{out}");
+    }
+
+    #[test]
+    fn emails_and_paths() {
+        assert!(!r("signed in as alex@example.com").contains("alex"));
+        assert_eq!(
+            r("/home/alex/.local/share/Kiln"),
+            "/home/<user>/.local/share/Kiln"
+        );
+        assert_eq!(r("C:\\Users\\Alex Smith\\x").matches("<user>").count(), 1);
+        assert!(!r(r"C:\\Users\\alex\\AppData").contains("alex"));
+        assert!(!r("/Users/alex/Library").contains("alex"));
+    }
+
+    #[test]
+    fn registered_secrets_are_masked_as_whole_words() {
+        let red = Redactor::new();
+        red.register_secret("Notch");
+        red.register_secret("ab"); // too short, ignored
+        assert_eq!(red.redact("hello notch!"), "hello [REDACTED]!");
+        assert_eq!(red.redact("Notchless"), "Notchless");
+        assert_eq!(red.redact("cab"), "cab");
+    }
+
+    #[test]
+    fn long_secrets_match_even_with_punctuation_at_the_edges() {
+        let red = Redactor::new();
+        let token = "M.C507_BAY.2.-CjSecret$value.";
+        red.register_secret(token);
+        assert_eq!(red.redact(&format!("x{token}y")), "x[REDACTED]y");
+    }
+
+    #[test]
+    fn registered_secrets_are_bounded() {
+        let red = Redactor::new();
+        for i in 0..(MAX_SECRETS + 10) {
+            red.register_secret(&format!("secret-value-number-{i:04}"));
+        }
+        assert_eq!(red.secrets.read().unwrap().len(), MAX_SECRETS);
+        // The oldest were evicted, the newest are still masked.
+        assert_eq!(
+            red.redact("secret-value-number-0000"),
+            "secret-value-number-0000"
+        );
+        assert_eq!(red.redact("secret-value-number-0073"), "[REDACTED]");
+    }
+
+    #[test]
+    fn plain_text_is_untouched_and_not_copied() {
+        let red = Redactor::new();
+        let s = "Loaded 142 mods in 3.2s (exit code 0)";
+        assert!(matches!(red.redact(s), Cow::Borrowed(_)));
+    }
+
+    #[test]
+    fn idempotent() {
+        let once = r("Bearer abc --username Steve /home/alex/x");
+        assert_eq!(r(&once), once);
+    }
+}
+
+<<<<<KILN-END>>>>>
+<<<<<KILN-FILE crates/kiln-core/src/settings.rs>>>>>
+//! Typed application settings persisted as one JSON row per key.
+//!
+//! Loading merges stored rows over the defaults and ignores anything unknown or invalid
+//! (so a downgrade or a hand-edited row can't brick the launcher). Writing validates the
+//! complete resulting settings before anything is stored.
+
+use serde::{Deserialize, Serialize};
+use serde_json::{Map, Value};
+
+use crate::db::Db;
+use crate::logging::LOG_LEVELS;
+use crate::{Error, Result};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Theme {
+    System,
+    Dark,
+    Light,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Settings {
+    pub theme: Theme,
+    /// `#rrggbb`
+    pub accent_color: String,
+    pub animated_background: bool,
+    pub reduce_motion: bool,
+    pub max_concurrent_downloads: u8,
+    /// `None` means "choose automatically".
+    pub default_ram_mb: Option<u32>,
+    pub check_updates_on_start: bool,
+    pub log_level: String,
+}
+
+impl Default for Settings {
+    fn default() -> Self {
+        Self {
+            theme: Theme::System,
+            accent_color: "#5fb99a".into(),
+            animated_background: false,
+            reduce_motion: false,
+            max_concurrent_downloads: 8,
+            default_ram_mb: None,
+            check_updates_on_start: true,
+            log_level: "info".into(),
+        }
+    }
+}
+
+fn invalid(key: &str, reason: &str) -> Error {
+    Error::InvalidSetting {
+        key: key.into(),
+        reason: reason.into(),
+    }
+}
+
+impl Settings {
+    pub fn validate(&self) -> Result<()> {
+        let c = self.accent_color.as_bytes();
+        if c.len() != 7 || c[0] != b'#' || !c[1..].iter().all(u8::is_ascii_hexdigit) {
+            return Err(invalid("accent_color", "use a color like #5fb99a"));
+        }
+        if !(1..=16).contains(&self.max_concurrent_downloads) {
+            return Err(invalid(
+                "max_concurrent_downloads",
+                "choose a number from 1 to 16",
+            ));
+        }
+        if let Some(mb) = self.default_ram_mb {
+            if !(512..=262_144).contains(&mb) {
+                return Err(invalid(
+                    "default_ram_mb",
+                    "choose between 512 MB and 256 GB",
+                ));
+            }
+        }
+        if !LOG_LEVELS.contains(&self.log_level.as_str()) {
+            return Err(invalid(
+                "log_level",
+                "choose error, warn, info, debug or trace",
+            ));
+        }
+        Ok(())
+    }
+
+    fn to_map(&self) -> Result<Map<String, Value>> {
+        match serde_json::to_value(self)? {
+            Value::Object(map) => Ok(map),
+            _ => Err(<serde_json::Error as serde::ser::Error>::custom(
+                "settings must serialize to an object",
+            )
+            .into()),
+        }
+    }
+
+    fn from_map(map: &Map<String, Value>) -> Option<Self> {
+        let settings: Self = serde_json::from_value(Value::Object(map.clone())).ok()?;
+        settings.validate().ok()?;
+        Some(settings)
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct SettingsStore {
+    db: Db,
+}
+
+impl SettingsStore {
+    pub fn new(db: Db) -> Self {
+        Self { db }
+    }
+
+    pub async fn load(&self) -> Result<Settings> {
+        let rows: Vec<(String, String)> = sqlx::query_as("SELECT key, value FROM settings")
+            .fetch_all(&self.db)
+            .await?;
+        let mut map = Settings::default().to_map()?;
+        for (key, raw) in rows {
+            let Ok(value) = serde_json::from_str::<Value>(&raw) else {
+                tracing::warn!(key, "ignoring unreadable stored setting");
+                continue;
+            };
+            let Some(previous) = map.insert(key.clone(), value) else {
+                // Unknown key (for example from a newer version): drop it again.
+                map.remove(&key);
+                continue;
+            };
+            if Settings::from_map(&map).is_none() {
+                tracing::warn!(key, "ignoring invalid stored setting");
+                map.insert(key, previous);
+            }
+        }
+        Ok(Settings::from_map(&map).unwrap_or_default())
+    }
+
+    /// Set one key. Returns the full updated settings.
+    pub async fn set(&self, key: &str, value: Value) -> Result<Settings> {
+        if key.len() > 64 || value.to_string().len() > 4096 {
+            return Err(invalid(key, "the value is too large"));
+        }
+        let mut map = self.load().await?.to_map()?;
+        if !map.contains_key(key) {
+            return Err(Error::UnknownSetting(key.into()));
+        }
+        map.insert(key.into(), value);
+        let mut updated: Settings = serde_json::from_value(Value::Object(map)).map_err(|e| {
+            tracing::debug!(error = %e, key, "setting rejected");
+            invalid(key, "the value is not valid for this setting")
+        })?;
+        updated.accent_color.make_ascii_lowercase();
+        updated.validate()?;
+
+        // Store the canonical form of the value, not the raw input.
+        let canonical = updated.to_map()?.remove(key).unwrap_or(Value::Null);
+        sqlx::query(
+            "INSERT INTO settings (key, value) VALUES (?1, ?2) \
+             ON CONFLICT (key) DO UPDATE SET value = excluded.value",
+        )
+        .bind(key)
+        .bind(canonical.to_string())
+        .execute(&self.db)
+        .await?;
+        Ok(updated)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::*;
+    use crate::db;
+
+    async fn store() -> SettingsStore {
+        SettingsStore::new(db::open_in_memory().await.unwrap())
+    }
+
+    #[test]
+    fn defaults_are_valid() {
+        Settings::default().validate().unwrap();
+    }
+
+    #[tokio::test]
+    async fn empty_database_yields_defaults() {
+        assert_eq!(store().await.load().await.unwrap(), Settings::default());
+    }
+
+    #[tokio::test]
+    async fn set_persists_and_round_trips() {
+        let s = store().await;
+        let updated = s.set("theme", json!("dark")).await.unwrap();
+        assert_eq!(updated.theme, Theme::Dark);
+        s.set("default_ram_mb", json!(4096)).await.unwrap();
+        s.set("default_ram_mb", Value::Null).await.unwrap();
+        s.set("max_concurrent_downloads", json!(4)).await.unwrap();
+
+        let loaded = s.load().await.unwrap();
+        assert_eq!(loaded.theme, Theme::Dark);
+        assert_eq!(loaded.default_ram_mb, None);
+        assert_eq!(loaded.max_concurrent_downloads, 4);
+    }
+
+    #[tokio::test]
+    async fn accent_color_is_normalized() {
+        let s = store().await;
+        let updated = s.set("accent_color", json!("#ABCDEF")).await.unwrap();
+        assert_eq!(updated.accent_color, "#abcdef");
+        assert_eq!(s.load().await.unwrap().accent_color, "#abcdef");
+    }
+
+    #[tokio::test]
+    async fn rejects_unknown_keys_wrong_types_and_out_of_range() {
+        let s = store().await;
+        assert!(matches!(
+            s.set("nope", json!(1)).await,
+            Err(Error::UnknownSetting(_))
+        ));
+        for (key, value) in [
+            ("theme", json!("purple")),
+            ("theme", json!(3)),
+            ("accent_color", json!("red")),
+            ("accent_color", json!("#12345")),
+            ("accent_color", json!("#12345g")),
+            ("max_concurrent_downloads", json!(0)),
+            ("max_concurrent_downloads", json!(17)),
+            ("max_concurrent_downloads", json!(300)),
+            ("max_concurrent_downloads", json!("8")),
+            ("default_ram_mb", json!(64)),
+            ("log_level", json!("verbose")),
+            ("animated_background", json!("yes")),
+        ] {
+            assert!(
+                matches!(
+                    s.set(key, value.clone()).await,
+                    Err(Error::InvalidSetting { .. })
+                ),
+                "accepted {key}={value}"
+            );
+        }
+        // Nothing invalid was stored.
+        assert_eq!(s.load().await.unwrap(), Settings::default());
+    }
+
+    #[tokio::test]
+    async fn rejects_oversized_input() {
+        let s = store().await;
+        let huge = json!("x".repeat(5000));
+        assert!(s.set("accent_color", huge).await.is_err());
+        assert!(s.set(&"k".repeat(65), json!(1)).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn load_ignores_corrupt_unknown_and_invalid_rows() {
+        let s = store().await;
+        s.set("theme", json!("light")).await.unwrap();
+        for (k, v) in [
+            ("log_level", "\"loud\""),          // fails validation
+            ("max_concurrent_downloads", "99"), // out of range
+            ("from_the_future", "true"),        // unknown key
+            ("animated_background", "null"),    // wrong type
+        ] {
+            sqlx::query("INSERT INTO settings (key, value) VALUES (?1, ?2)")
+                .bind(k)
+                .bind(v)
+                .execute(&s.db)
+                .await
+                .unwrap();
+        }
+        let loaded = s.load().await.unwrap();
+        assert_eq!(loaded.theme, Theme::Light, "valid rows still apply");
+        assert_eq!(loaded.log_level, "info");
+        assert_eq!(loaded.max_concurrent_downloads, 8);
+        assert!(!loaded.animated_background);
+    }
+}
+
+<<<<<KILN-END>>>>>
+<<<<<KILN-FILE crates/kiln-core/tests/logging_file.rs>>>>>
+//! End-to-end: initialise the real subscriber (once per process, hence a separate test
+//! binary), log secrets, and confirm none reach the log file on disk.
+
+use kiln_core::logging;
+
+#[test]
+fn log_file_never_contains_secrets() {
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let guard = logging::init(dir.path(), "info", false).unwrap();
+        tracing::info!("signed in alex@example.com with refresh_token=M.R3_BAY.TOPSECRET");
+        tracing::debug!("this debug line is below the level and must not appear");
+        guard.set_level("debug").unwrap();
+        tracing::debug!("now visible, still no --accessToken hunter2");
+        assert!(guard.set_level("nonsense").is_err());
+        // Dropping the guard flushes the background writer.
+    }
+
+    let mut combined = String::new();
+    for entry in std::fs::read_dir(dir.path()).unwrap() {
+        combined.push_str(&std::fs::read_to_string(entry.unwrap().path()).unwrap());
+    }
+
+    assert!(combined.contains("signed in"), "{combined}");
+    assert!(combined.contains("now visible"), "{combined}");
+    assert!(!combined.contains("must not appear"), "{combined}");
+    for leaked in ["alex@example.com", "TOPSECRET", "hunter2"] {
+        assert!(!combined.contains(leaked), "leaked {leaked}: {combined}");
+    }
+}
+
+<<<<<KILN-END>>>>>

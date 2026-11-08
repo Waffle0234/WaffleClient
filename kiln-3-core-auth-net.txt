@@ -1,0 +1,2799 @@
+Kiln source bundle 3 of 6: kiln-core network and auth: allowlisted HTTP client, Microsoft/Xbox/Minecraft sign-in, keychain, accounts.
+Rebuild the repository by running `python3 restore.py` next to these files. Text before the first marker is ignored.
+
+<<<<<KILN-FILE crates/kiln-core/src/auth/accounts.rs>>>>>
+//! Non-secret account metadata in SQLite. Tokens never touch this table.
+
+use serde::Serialize;
+use sqlx::FromRow;
+
+use super::error::AuthError;
+use super::minecraft::Profile;
+use crate::db::Db;
+use crate::Result;
+
+pub const TEXTURE_BASE: &str = "https://textures.minecraft.net/texture/";
+
+pub fn texture_url(hash: &str) -> String {
+    format!("{TEXTURE_BASE}{hash}")
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SkinVariant {
+    Classic,
+    Slim,
+}
+
+impl SkinVariant {
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.to_ascii_lowercase().as_str() {
+            "classic" => Some(Self::Classic),
+            "slim" => Some(Self::Slim),
+            _ => None,
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Classic => "classic",
+            Self::Slim => "slim",
+        }
+    }
+}
+
+/// Accounts are identified by the Minecraft player UUID: 32 lowercase hex characters.
+pub fn is_valid_account_id(id: &str) -> bool {
+    id.len() == 32 && id.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+}
+
+pub fn validate_account_id(id: &str) -> Result<()> {
+    if is_valid_account_id(id) {
+        Ok(())
+    } else {
+        Err(AuthError::InvalidAccountId.into())
+    }
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct Account {
+    pub id: String,
+    pub username: String,
+    pub skin_url: Option<String>,
+    pub skin_variant: Option<SkinVariant>,
+    pub cape_url: Option<String>,
+    pub last_used: Option<i64>,
+    pub is_active: bool,
+    /// The Microsoft sign-in was revoked or expired: the account must be signed in again.
+    pub needs_reauth: bool,
+}
+
+#[derive(FromRow)]
+struct Row {
+    id: String,
+    username: String,
+    skin_hash: Option<String>,
+    skin_variant: Option<String>,
+    cape_hash: Option<String>,
+    last_used: Option<i64>,
+    is_active: i64,
+    needs_reauth: i64,
+}
+
+impl From<Row> for Account {
+    fn from(r: Row) -> Self {
+        Self {
+            id: r.id,
+            username: r.username,
+            skin_url: r.skin_hash.as_deref().map(texture_url),
+            skin_variant: r.skin_variant.as_deref().and_then(SkinVariant::parse),
+            cape_url: r.cape_hash.as_deref().map(texture_url),
+            last_used: r.last_used,
+            is_active: r.is_active != 0,
+            needs_reauth: r.needs_reauth != 0,
+        }
+    }
+}
+
+const COLUMNS: &str =
+    "id, username, skin_hash, skin_variant, cape_hash, last_used, is_active, needs_reauth";
+
+pub async fn list(db: &Db) -> Result<Vec<Account>> {
+    let rows: Vec<Row> = sqlx::query_as(&format!(
+        "SELECT {COLUMNS} FROM accounts ORDER BY is_active DESC, last_used DESC, username COLLATE NOCASE"
+    ))
+    .fetch_all(db)
+    .await?;
+    Ok(rows.into_iter().map(Account::from).collect())
+}
+
+pub async fn get(db: &Db, id: &str) -> Result<Option<Account>> {
+    let row: Option<Row> = sqlx::query_as(&format!("SELECT {COLUMNS} FROM accounts WHERE id = ?1"))
+        .bind(id)
+        .fetch_optional(db)
+        .await?;
+    Ok(row.map(Account::from))
+}
+
+/// Insert or update a freshly signed-in account and make it the active one.
+pub async fn upsert_signed_in(db: &Db, p: &Profile, now: i64) -> Result<Account> {
+    let mut tx = db.begin().await?;
+    sqlx::query("UPDATE accounts SET is_active = 0 WHERE is_active = 1")
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query(
+        "INSERT INTO accounts (id, username, skin_hash, skin_variant, cape_hash, last_used, is_active, needs_reauth) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, 1, 0) \
+         ON CONFLICT (id) DO UPDATE SET username = excluded.username, skin_hash = excluded.skin_hash, \
+           skin_variant = excluded.skin_variant, cape_hash = excluded.cape_hash, \
+           last_used = excluded.last_used, is_active = 1, needs_reauth = 0",
+    )
+    .bind(&p.id)
+    .bind(&p.name)
+    .bind(&p.skin_hash)
+    .bind(p.skin_variant.map(SkinVariant::as_str))
+    .bind(&p.cape_hash)
+    .bind(now)
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    get(db, &p.id)
+        .await?
+        .ok_or_else(|| AuthError::AccountNotFound.into())
+}
+
+/// Refresh profile details after a token refresh (the player may have renamed or changed
+/// skin). Keeps the active flag; clears `needs_reauth`.
+pub async fn update_profile(db: &Db, p: &Profile) -> Result<()> {
+    sqlx::query(
+        "UPDATE accounts SET username = ?2, skin_hash = ?3, skin_variant = ?4, cape_hash = ?5, needs_reauth = 0 \
+         WHERE id = ?1",
+    )
+    .bind(&p.id)
+    .bind(&p.name)
+    .bind(&p.skin_hash)
+    .bind(p.skin_variant.map(SkinVariant::as_str))
+    .bind(&p.cape_hash)
+    .execute(db)
+    .await?;
+    Ok(())
+}
+
+pub async fn mark_needs_reauth(db: &Db, id: &str) -> Result<()> {
+    sqlx::query("UPDATE accounts SET needs_reauth = 1 WHERE id = ?1")
+        .bind(id)
+        .execute(db)
+        .await?;
+    Ok(())
+}
+
+pub async fn set_active(db: &Db, id: &str, now: i64) -> Result<Account> {
+    let mut tx = db.begin().await?;
+    let exists: Option<(i64,)> = sqlx::query_as("SELECT 1 FROM accounts WHERE id = ?1")
+        .bind(id)
+        .fetch_optional(&mut *tx)
+        .await?;
+    if exists.is_none() {
+        return Err(AuthError::AccountNotFound.into());
+    }
+    sqlx::query("UPDATE accounts SET is_active = 0 WHERE is_active = 1")
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("UPDATE accounts SET is_active = 1, last_used = ?2 WHERE id = ?1")
+        .bind(id)
+        .bind(now)
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await?;
+    get(db, id)
+        .await?
+        .ok_or_else(|| AuthError::AccountNotFound.into())
+}
+
+/// Delete an account row. If it was the active one, the most recently used remaining
+/// account becomes active.
+pub async fn remove(db: &Db, id: &str) -> Result<()> {
+    let mut tx = db.begin().await?;
+    let was_active: Option<(i64,)> = sqlx::query_as("SELECT is_active FROM accounts WHERE id = ?1")
+        .bind(id)
+        .fetch_optional(&mut *tx)
+        .await?;
+    let Some((was_active,)) = was_active else {
+        return Err(AuthError::AccountNotFound.into());
+    };
+    sqlx::query("DELETE FROM accounts WHERE id = ?1")
+        .bind(id)
+        .execute(&mut *tx)
+        .await?;
+    if was_active != 0 {
+        sqlx::query(
+            "UPDATE accounts SET is_active = 1 WHERE id = \
+             (SELECT id FROM accounts ORDER BY last_used DESC, username COLLATE NOCASE LIMIT 1)",
+        )
+        .execute(&mut *tx)
+        .await?;
+    }
+    tx.commit().await?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db;
+
+    pub fn profile(id_char: char, name: &str) -> Profile {
+        Profile {
+            id: id_char.to_string().repeat(32),
+            name: name.into(),
+            skin_hash: Some("0123456789abcdef".repeat(4)),
+            skin_variant: Some(SkinVariant::Slim),
+            cape_hash: None,
+        }
+    }
+
+    #[test]
+    fn account_id_validation() {
+        assert!(is_valid_account_id(&"a".repeat(32)));
+        assert!(is_valid_account_id("069a79f44e9d4e9cb12bd4a2bb7d6fd4"));
+        for bad in [
+            "",
+            "abc",
+            &"A".repeat(32),
+            &"g".repeat(32),
+            &"a".repeat(33),
+            "../../etc/passwd",
+        ] {
+            assert!(!is_valid_account_id(bad), "accepted {bad:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn newest_sign_in_becomes_the_only_active_account() {
+        let db = db::open_in_memory().await.unwrap();
+        upsert_signed_in(&db, &profile('a', "Alex"), 100)
+            .await
+            .unwrap();
+        let b = upsert_signed_in(&db, &profile('b', "Bea"), 200)
+            .await
+            .unwrap();
+        assert!(b.is_active);
+
+        let all = list(&db).await.unwrap();
+        assert_eq!(all.iter().filter(|a| a.is_active).count(), 1);
+        assert_eq!(all[0].username, "Bea", "active account sorts first");
+        assert!(b.skin_url.unwrap().starts_with(TEXTURE_BASE));
+        assert_eq!(b.skin_variant, Some(SkinVariant::Slim));
+    }
+
+    #[tokio::test]
+    async fn signing_in_again_updates_in_place_and_clears_reauth() {
+        let db = db::open_in_memory().await.unwrap();
+        upsert_signed_in(&db, &profile('a', "Alex"), 100)
+            .await
+            .unwrap();
+        mark_needs_reauth(&db, &"a".repeat(32)).await.unwrap();
+        assert!(list(&db).await.unwrap()[0].needs_reauth);
+
+        let again = upsert_signed_in(&db, &profile('a', "AlexRenamed"), 300)
+            .await
+            .unwrap();
+        assert_eq!(list(&db).await.unwrap().len(), 1);
+        assert_eq!(again.username, "AlexRenamed");
+        assert!(!again.needs_reauth);
+    }
+
+    #[tokio::test]
+    async fn set_active_switches_and_rejects_unknown() {
+        let db = db::open_in_memory().await.unwrap();
+        upsert_signed_in(&db, &profile('a', "Alex"), 100)
+            .await
+            .unwrap();
+        upsert_signed_in(&db, &profile('b', "Bea"), 200)
+            .await
+            .unwrap();
+
+        let a = set_active(&db, &"a".repeat(32), 300).await.unwrap();
+        assert!(a.is_active);
+        assert_eq!(
+            list(&db)
+                .await
+                .unwrap()
+                .iter()
+                .filter(|x| x.is_active)
+                .count(),
+            1
+        );
+
+        let err = set_active(&db, &"c".repeat(32), 400).await.unwrap_err();
+        assert!(matches!(
+            err,
+            crate::Error::Auth(AuthError::AccountNotFound)
+        ));
+        // The failed switch must not have deactivated anything.
+        assert!(list(&db).await.unwrap().iter().any(|x| x.is_active));
+    }
+
+    #[tokio::test]
+    async fn removing_the_active_account_promotes_the_most_recent_other() {
+        let db = db::open_in_memory().await.unwrap();
+        upsert_signed_in(&db, &profile('a', "Alex"), 100)
+            .await
+            .unwrap();
+        upsert_signed_in(&db, &profile('b', "Bea"), 200)
+            .await
+            .unwrap();
+        upsert_signed_in(&db, &profile('c', "Cy"), 300)
+            .await
+            .unwrap();
+
+        remove(&db, &"c".repeat(32)).await.unwrap();
+        let all = list(&db).await.unwrap();
+        assert_eq!(all.len(), 2);
+        let active: Vec<_> = all.iter().filter(|a| a.is_active).collect();
+        assert_eq!(active.len(), 1);
+        assert_eq!(active[0].username, "Bea");
+
+        remove(&db, &"a".repeat(32)).await.unwrap();
+        remove(&db, &"b".repeat(32)).await.unwrap();
+        assert!(list(&db).await.unwrap().is_empty());
+        assert!(matches!(
+            remove(&db, &"b".repeat(32)).await.unwrap_err(),
+            crate::Error::Auth(AuthError::AccountNotFound)
+        ));
+    }
+
+    #[tokio::test]
+    async fn update_profile_keeps_active_flag() {
+        let db = db::open_in_memory().await.unwrap();
+        upsert_signed_in(&db, &profile('a', "Alex"), 100)
+            .await
+            .unwrap();
+        update_profile(&db, &profile('a', "NewName")).await.unwrap();
+        let a = &list(&db).await.unwrap()[0];
+        assert_eq!(a.username, "NewName");
+        assert!(a.is_active);
+    }
+}
+
+<<<<<KILN-END>>>>>
+<<<<<KILN-FILE crates/kiln-core/src/auth/endpoints.rs>>>>>
+use crate::net::HostPolicy;
+
+/// Every URL the sign-in chain talks to. Overridable so tests can point at a mock server.
+#[derive(Debug, Clone)]
+pub struct Endpoints {
+    pub device_code: String,
+    pub token: String,
+    pub xbox_user_auth: String,
+    pub xsts: String,
+    pub minecraft_login: String,
+    pub minecraft_profile: String,
+}
+
+impl Default for Endpoints {
+    fn default() -> Self {
+        Self {
+            device_code: "https://login.microsoftonline.com/consumers/oauth2/v2.0/devicecode"
+                .into(),
+            token: "https://login.microsoftonline.com/consumers/oauth2/v2.0/token".into(),
+            xbox_user_auth: "https://user.auth.xboxlive.com/user/authenticate".into(),
+            xsts: "https://xsts.auth.xboxlive.com/xsts/authorize".into(),
+            minecraft_login: "https://api.minecraftservices.com/authentication/login_with_xbox"
+                .into(),
+            minecraft_profile: "https://api.minecraftservices.com/minecraft/profile".into(),
+        }
+    }
+}
+
+impl Endpoints {
+    #[cfg(test)]
+    pub fn with_base(base: &str) -> Self {
+        Self {
+            device_code: format!("{base}/devicecode"),
+            token: format!("{base}/token"),
+            xbox_user_auth: format!("{base}/xbl"),
+            xsts: format!("{base}/xsts"),
+            minecraft_login: format!("{base}/mclogin"),
+            minecraft_profile: format!("{base}/profile"),
+        }
+    }
+}
+
+/// The only hosts the sign-in client may contact.
+pub fn host_policy() -> HostPolicy {
+    HostPolicy::new(&[
+        "login.microsoftonline.com",
+        "user.auth.xboxlive.com",
+        "xsts.auth.xboxlive.com",
+        "api.minecraftservices.com",
+    ])
+}
+
+<<<<<KILN-END>>>>>
+<<<<<KILN-FILE crates/kiln-core/src/auth/error.rs>>>>>
+use crate::Error;
+
+#[derive(Debug, thiserror::Error)]
+pub enum AuthError {
+    #[error("Microsoft sign-in is not configured (no valid client id)")]
+    NotConfigured,
+    #[error("no sign-in is in progress")]
+    NoPendingFlow,
+    #[error("the sign-in code expired")]
+    FlowExpired,
+    #[error("sign-in was declined on the Microsoft page")]
+    FlowDeclined,
+    #[error("sign-in was cancelled")]
+    FlowCancelled,
+    #[error("the refresh token was rejected; the user must sign in again")]
+    ReauthRequired,
+    #[error("the Microsoft account has no Xbox profile")]
+    XboxNoAccount,
+    #[error("Xbox is not available in this account's region")]
+    XboxRegionBlocked,
+    #[error("the account needs adult verification")]
+    XboxAdultVerification,
+    #[error("the account is a child account that needs a family group")]
+    XboxChildAccount,
+    #[error("Xbox returned error {0}")]
+    XboxOther(u64),
+    #[error("Mojang rejected this app registration")]
+    AppNotApproved,
+    #[error("the account does not own Minecraft: Java Edition")]
+    NoGameOwnership,
+    #[error("no such account")]
+    AccountNotFound,
+    #[error("invalid account id")]
+    InvalidAccountId,
+    #[error("unexpected response from {service}: {detail}")]
+    Unexpected {
+        service: &'static str,
+        detail: String,
+    },
+}
+
+/// Build an "unexpected response" error. `detail` must never contain a token or body.
+pub(crate) fn unexpected(service: &'static str, detail: impl Into<String>) -> Error {
+    AuthError::Unexpected {
+        service,
+        detail: detail.into(),
+    }
+    .into()
+}
+
+impl AuthError {
+    pub fn code(&self) -> &'static str {
+        match self {
+            Self::NotConfigured => "auth_not_configured",
+            Self::NoPendingFlow => "auth_no_flow",
+            Self::FlowExpired => "auth_expired",
+            Self::FlowDeclined => "auth_declined",
+            Self::FlowCancelled => "auth_cancelled",
+            Self::ReauthRequired => "auth_reauth",
+            Self::XboxNoAccount => "xbox_no_account",
+            Self::XboxRegionBlocked => "xbox_region",
+            Self::XboxAdultVerification => "xbox_adult",
+            Self::XboxChildAccount => "xbox_child",
+            Self::XboxOther(_) => "xbox_other",
+            Self::AppNotApproved => "app_not_approved",
+            Self::NoGameOwnership => "no_game",
+            Self::AccountNotFound => "account_not_found",
+            Self::InvalidAccountId => "invalid_account_id",
+            Self::Unexpected { .. } => "auth_unexpected",
+        }
+    }
+
+    pub fn user_message(&self) -> String {
+        match self {
+            Self::NotConfigured => "Microsoft sign-in isn't set up in this build of Kiln.".into(),
+            Self::NoPendingFlow => "There's no sign-in in progress. Start again.".into(),
+            Self::FlowExpired => {
+                "The sign-in code expired before it was used. Start again to get a new one.".into()
+            }
+            Self::FlowDeclined => "Sign-in was cancelled on the Microsoft page.".into(),
+            Self::FlowCancelled => "Sign-in was cancelled.".into(),
+            Self::ReauthRequired => "Your Microsoft sign-in for this account has expired or was \
+                revoked. Sign in again to keep using it."
+                .into(),
+            Self::XboxNoAccount => "This Microsoft account doesn't have an Xbox profile yet. \
+                Sign in once at xbox.com to create one, then try again."
+                .into(),
+            Self::XboxRegionBlocked => "Xbox services aren't available in the country or region \
+                this Microsoft account is set to."
+                .into(),
+            Self::XboxAdultVerification => "This account needs adult verification on the Xbox \
+                site before it can be used for Minecraft."
+                .into(),
+            Self::XboxChildAccount => "This is a child account. An adult has to add it to a \
+                Microsoft family group before it can sign in to Minecraft."
+                .into(),
+            Self::XboxOther(code) => {
+                format!("Xbox refused the sign-in (error {code}). Try again later.")
+            }
+            Self::AppNotApproved => "Mojang hasn't approved this build's Microsoft app \
+                registration, so Minecraft sign-in is refused."
+                .into(),
+            Self::NoGameOwnership => "This Microsoft account doesn't own Minecraft: Java \
+                Edition. Kiln needs a legitimately owned copy for online play."
+                .into(),
+            Self::AccountNotFound => "That account no longer exists.".into(),
+            Self::InvalidAccountId => "That isn't a valid account.".into(),
+            Self::Unexpected { .. } => "Microsoft or Mojang sent a response Kiln didn't expect. \
+                Try again later."
+                .into(),
+        }
+    }
+}
+
+<<<<<KILN-END>>>>>
+<<<<<KILN-FILE crates/kiln-core/src/auth/keystore.rs>>>>>
+//! Where refresh tokens live: the operating system's keychain, and nowhere else.
+//! (Windows Credential Manager, macOS Keychain, Secret Service on Linux.)
+//!
+//! Secrets are stored as raw bytes. The string API on Windows stores UTF-16, which would
+//! double a ~1.5 KB Microsoft refresh token and risk exceeding Credential Manager's
+//! 2,560-byte limit.
+
+use crate::{Error, Result};
+
+pub trait SecretStore: Send + Sync {
+    fn set(&self, account_id: &str, secret: &[u8]) -> Result<()>;
+    fn get(&self, account_id: &str) -> Result<Option<Vec<u8>>>;
+    /// Deleting something that doesn't exist is not an error.
+    fn delete(&self, account_id: &str) -> Result<()>;
+}
+
+#[derive(Debug, Clone)]
+pub struct KeyringStore {
+    service: String,
+}
+
+impl KeyringStore {
+    pub fn new(service: impl Into<String>) -> Self {
+        Self {
+            service: service.into(),
+        }
+    }
+
+    fn entry(&self, account_id: &str) -> Result<keyring::Entry> {
+        keyring::Entry::new(&self.service, &format!("msa-refresh-token:{account_id}"))
+            .map_err(keychain_err)
+    }
+}
+
+fn keychain_err(e: keyring::Error) -> Error {
+    Error::Keychain(e.to_string())
+}
+
+impl SecretStore for KeyringStore {
+    fn set(&self, account_id: &str, secret: &[u8]) -> Result<()> {
+        self.entry(account_id)?
+            .set_secret(secret)
+            .map_err(keychain_err)
+    }
+
+    fn get(&self, account_id: &str) -> Result<Option<Vec<u8>>> {
+        match self.entry(account_id)?.get_secret() {
+            Ok(v) => Ok(Some(v)),
+            Err(keyring::Error::NoEntry) => Ok(None),
+            Err(e) => Err(keychain_err(e)),
+        }
+    }
+
+    fn delete(&self, account_id: &str) -> Result<()> {
+        match self.entry(account_id)?.delete_credential() {
+            Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
+            Err(e) => Err(keychain_err(e)),
+        }
+    }
+}
+
+/// In-memory store for tests. Deliberately not available outside `cfg(test)`, so a
+/// production build can't accidentally keep tokens in an unprotected place.
+#[cfg(test)]
+#[derive(Default)]
+pub struct MemoryStore(std::sync::Mutex<std::collections::HashMap<String, Vec<u8>>>);
+
+#[cfg(test)]
+impl MemoryStore {
+    pub fn snapshot(&self) -> std::collections::HashMap<String, Vec<u8>> {
+        self.0.lock().unwrap().clone()
+    }
+}
+
+#[cfg(test)]
+impl SecretStore for MemoryStore {
+    fn set(&self, id: &str, secret: &[u8]) -> Result<()> {
+        self.0.lock().unwrap().insert(id.into(), secret.to_vec());
+        Ok(())
+    }
+    fn get(&self, id: &str) -> Result<Option<Vec<u8>>> {
+        Ok(self.0.lock().unwrap().get(id).cloned())
+    }
+    fn delete(&self, id: &str) -> Result<()> {
+        self.0.lock().unwrap().remove(id);
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn memory_store_semantics() {
+        let s = MemoryStore::default();
+        assert_eq!(s.get("a").unwrap(), None);
+        s.set("a", b"one").unwrap();
+        s.set("a", b"two").unwrap();
+        assert_eq!(s.get("a").unwrap().as_deref(), Some(&b"two"[..]));
+        s.delete("a").unwrap();
+        s.delete("a").unwrap(); // idempotent
+        assert_eq!(s.get("a").unwrap(), None);
+    }
+
+    /// Round trip against the real OS keychain. Ignored by default because CI runners and
+    /// containers often have no unlocked keychain (on Linux it needs a running Secret
+    /// Service such as gnome-keyring). Run with `cargo test -- --ignored keyring`.
+    #[test]
+    #[ignore = "needs an unlocked OS keychain"]
+    fn keyring_round_trip_with_a_realistic_token_size() {
+        let store = KeyringStore::new(format!("kiln-test-{}", std::process::id()));
+        let id = "11111111111111112222222222222222";
+        // About the size of a real Microsoft refresh token, and above the 1,280 characters
+        // a UTF-16 encoding would allow on Windows.
+        let token = "M.C507_BAY.0.U.".to_string() + &"x".repeat(1900);
+
+        store.set(id, token.as_bytes()).unwrap();
+        assert_eq!(store.get(id).unwrap().as_deref(), Some(token.as_bytes()));
+        store.delete(id).unwrap();
+        assert_eq!(store.get(id).unwrap(), None);
+        store.delete(id).unwrap();
+    }
+}
+
+<<<<<KILN-END>>>>>
+<<<<<KILN-FILE crates/kiln-core/src/auth/minecraft.rs>>>>>
+//! Minecraft services: exchange the XSTS token for a game token, then read the profile.
+//! A missing profile (404) means the account doesn't own Minecraft: Java Edition.
+
+use std::time::Duration;
+
+use reqwest::{Method, Url};
+use serde::Deserialize;
+use serde_json::json;
+
+use super::accounts::{is_valid_account_id, SkinVariant};
+use super::endpoints::Endpoints;
+use super::error::{unexpected, AuthError};
+use super::secret::SecretString;
+use super::xbox::XboxToken;
+use crate::net::{Body, HttpClient};
+use crate::Result;
+
+pub struct McLogin {
+    pub access_token: SecretString,
+    pub expires_in: Duration,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Profile {
+    /// 32 lowercase hex characters (the player UUID without dashes).
+    pub id: String,
+    pub name: String,
+    pub skin_hash: Option<String>,
+    pub skin_variant: Option<SkinVariant>,
+    pub cape_hash: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct LoginResponse {
+    access_token: String,
+    expires_in: u64,
+}
+
+#[derive(Deserialize)]
+struct RawProfile {
+    id: String,
+    name: String,
+    #[serde(default)]
+    skins: Vec<RawTexture>,
+    #[serde(default)]
+    capes: Vec<RawTexture>,
+}
+
+#[derive(Deserialize)]
+struct RawTexture {
+    state: Option<String>,
+    url: String,
+    variant: Option<String>,
+}
+
+/// Extract the texture hash from a Mojang texture URL. Mojang serves these over plain
+/// `http://`; only the host and a hex hash are trusted, and the UI rebuilds an HTTPS URL.
+pub fn texture_hash(url: &str) -> Option<String> {
+    let url = Url::parse(url).ok()?;
+    if url.host_str() != Some("textures.minecraft.net") {
+        return None;
+    }
+    let hash = url.path().strip_prefix("/texture/")?;
+    let ok = (8..=64).contains(&hash.len())
+        && hash.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'));
+    ok.then(|| hash.to_owned())
+}
+
+fn is_active(t: &RawTexture) -> bool {
+    t.state
+        .as_deref()
+        .is_some_and(|s| s.eq_ignore_ascii_case("ACTIVE"))
+}
+
+fn valid_name(name: &str) -> bool {
+    (1..=16).contains(&name.len()) && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
+}
+
+fn parse_profile(raw: RawProfile) -> Result<Profile> {
+    let id = raw.id.to_ascii_lowercase().replace('-', "");
+    if !is_valid_account_id(&id) || !valid_name(&raw.name) {
+        return Err(unexpected(
+            "Minecraft",
+            "profile id or name failed validation",
+        ));
+    }
+    let skin = raw
+        .skins
+        .iter()
+        .find(|t| is_active(t))
+        .or(raw.skins.first());
+    let cape = raw.capes.iter().find(|t| is_active(t));
+    Ok(Profile {
+        id,
+        name: raw.name,
+        skin_hash: skin.and_then(|t| texture_hash(&t.url)),
+        skin_variant: skin
+            .and_then(|t| t.variant.as_deref())
+            .and_then(SkinVariant::parse),
+        cape_hash: cape.and_then(|t| texture_hash(&t.url)),
+    })
+}
+
+pub async fn login_with_xbox(
+    http: &HttpClient,
+    ep: &Endpoints,
+    xsts: &XboxToken,
+) -> Result<McLogin> {
+    let body = json!({ "identityToken": format!("XBL3.0 x={};{}", xsts.uhs, xsts.token.expose()) });
+    let resp = http
+        .execute(Method::POST, &ep.minecraft_login, Body::Json(&body), None)
+        .await?;
+    match resp.status {
+        // Mojang answers 403 "Invalid app registration" for client ids it hasn't approved.
+        403 => Err(AuthError::AppNotApproved.into()),
+        s if !(200..300).contains(&s) => {
+            Err(unexpected("Minecraft", format!("HTTP {s} from login")))
+        }
+        _ => {
+            let body: LoginResponse = resp.json()?;
+            Ok(McLogin {
+                access_token: SecretString::new(body.access_token),
+                expires_in: Duration::from_secs(body.expires_in.clamp(60, 172_800)),
+            })
+        }
+    }
+}
+
+pub async fn fetch_profile(
+    http: &HttpClient,
+    ep: &Endpoints,
+    token: &SecretString,
+) -> Result<Profile> {
+    let resp = http
+        .execute(
+            Method::GET,
+            &ep.minecraft_profile,
+            Body::Empty,
+            Some(token.expose()),
+        )
+        .await?;
+    match resp.status {
+        404 => Err(AuthError::NoGameOwnership.into()),
+        s if !(200..300).contains(&s) => Err(unexpected(
+            "Minecraft",
+            format!("HTTP {s} reading the profile"),
+        )),
+        _ => parse_profile(resp.json()?),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const HASH: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+    #[test]
+    fn texture_hash_accepts_only_mojang_texture_urls() {
+        let good = format!("http://textures.minecraft.net/texture/{HASH}");
+        assert_eq!(texture_hash(&good).as_deref(), Some(HASH));
+        assert!(texture_hash(&good.replace("http:", "https:")).is_some());
+        for bad in [
+            "http://evil.example/texture/0123456789abcdef",
+            "http://textures.minecraft.net.evil.net/texture/0123456789abcdef",
+            "http://textures.minecraft.net/other/0123456789abcdef",
+            "http://textures.minecraft.net/texture/../../x",
+            "http://textures.minecraft.net/texture/NOTHEX!!NOTHEX!!",
+            "http://textures.minecraft.net/texture/abc",
+            "garbage",
+        ] {
+            assert!(texture_hash(bad).is_none(), "accepted {bad}");
+        }
+    }
+
+    fn raw(json: serde_json::Value) -> RawProfile {
+        serde_json::from_value(json).unwrap()
+    }
+
+    #[test]
+    fn profile_parsing_normalizes_and_picks_active_textures() {
+        let p = parse_profile(raw(serde_json::json!({
+            "id": "069A79F4-4E9D-4E9C-B12B-D4A2BB7D6FD4",
+            "name": "Steve_1",
+            "skins": [
+                {"state": "INACTIVE", "url": format!("http://textures.minecraft.net/texture/{}", "a".repeat(64)), "variant": "CLASSIC"},
+                {"state": "ACTIVE", "url": format!("http://textures.minecraft.net/texture/{HASH}"), "variant": "slim"}
+            ],
+            "capes": [{"state": "ACTIVE", "url": format!("http://textures.minecraft.net/texture/{}", "b".repeat(64))}]
+        })))
+        .unwrap();
+        assert_eq!(p.id, "069a79f44e9d4e9cb12bd4a2bb7d6fd4");
+        assert_eq!(p.skin_hash.as_deref(), Some(HASH));
+        assert_eq!(p.skin_variant, Some(SkinVariant::Slim));
+        assert_eq!(p.cape_hash, Some("b".repeat(64)));
+    }
+
+    #[test]
+    fn profile_without_textures_is_fine_and_bad_identity_is_rejected() {
+        let p = parse_profile(raw(
+            serde_json::json!({"id": "a".repeat(32), "name": "Alex"}),
+        ))
+        .unwrap();
+        assert!(p.skin_hash.is_none() && p.cape_hash.is_none());
+
+        for (id, name) in [
+            ("short", "Alex"),
+            (&"a".repeat(32), "bad name!"),
+            (&"a".repeat(32), ""),
+        ] {
+            assert!(parse_profile(raw(serde_json::json!({"id": id, "name": name}))).is_err());
+        }
+    }
+}
+
+<<<<<KILN-END>>>>>
+<<<<<KILN-FILE crates/kiln-core/src/auth/mod.rs>>>>>
+//! Microsoft → Xbox Live → XSTS → Minecraft sign-in.
+//!
+//! Security properties:
+//! - refresh tokens are written only to the OS keychain ([`keystore`]);
+//! - access tokens live in memory only, in a [`SecretString`] that hides itself from
+//!   `Debug` and is wiped on drop;
+//! - no token ever crosses the IPC boundary: the UI sees [`Account`] and
+//!   [`DeviceCodeInfo`], and only the launch pipeline can obtain a [`LaunchSession`];
+//! - nothing in this module logs a token, a response body, or a username.
+
+mod accounts;
+mod endpoints;
+mod error;
+mod keystore;
+mod minecraft;
+mod ms;
+mod secret;
+mod service;
+mod xbox;
+
+pub use accounts::{is_valid_account_id, texture_url, Account, SkinVariant};
+pub use endpoints::{host_policy, Endpoints};
+pub use error::AuthError;
+pub use keystore::{KeyringStore, SecretStore};
+pub use secret::SecretString;
+pub use service::{client_id_from_env, AuthService, DeviceCodeInfo, LaunchSession, Timing};
+
+<<<<<KILN-END>>>>>
+<<<<<KILN-FILE crates/kiln-core/src/auth/ms.rs>>>>>
+//! Microsoft identity platform, device-code flow.
+//! <https://learn.microsoft.com/entra/identity-platform/v2-oauth2-device-code>
+
+use std::time::Duration;
+
+use reqwest::{Method, Url};
+use serde::Deserialize;
+
+use super::endpoints::Endpoints;
+use super::error::{unexpected, AuthError};
+use super::secret::SecretString;
+use crate::net::{Body, HttpClient};
+use crate::Result;
+
+const SCOPE: &str = "XboxLive.signin offline_access";
+const DEVICE_GRANT: &str = "urn:ietf:params:oauth:grant-type:device_code";
+/// Where the server may send the user to enter the code. Checked because the UI offers
+/// to open this address in the browser.
+const VERIFICATION_HOSTS: &[&str] = &[
+    "www.microsoft.com",
+    "microsoft.com",
+    "login.microsoftonline.com",
+    "login.live.com",
+    "aka.ms",
+];
+
+pub struct DeviceCode {
+    pub device_code: SecretString,
+    pub user_code: String,
+    pub verification_uri: String,
+    pub expires_in: Duration,
+    pub interval: Duration,
+}
+
+pub struct MsTokens {
+    pub access_token: SecretString,
+    pub refresh_token: Option<SecretString>,
+}
+
+pub enum PollOutcome {
+    Tokens(MsTokens),
+    Pending,
+    SlowDown,
+}
+
+#[derive(Deserialize)]
+struct DeviceCodeResponse {
+    device_code: String,
+    user_code: String,
+    verification_uri: String,
+    expires_in: u64,
+    interval: Option<u64>,
+}
+
+#[derive(Deserialize)]
+struct TokenResponse {
+    access_token: Option<String>,
+    refresh_token: Option<String>,
+    error: Option<String>,
+}
+
+fn short(code: &str) -> String {
+    code.chars().take(64).collect()
+}
+
+fn valid_user_code(code: &str) -> bool {
+    (1..=32).contains(&code.len()) && code.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+}
+
+fn valid_verification_uri(uri: &str) -> bool {
+    Url::parse(uri).is_ok_and(|u| {
+        u.scheme() == "https"
+            && u.username().is_empty()
+            && u.host_str()
+                .is_some_and(|h| VERIFICATION_HOSTS.contains(&h))
+    })
+}
+
+pub async fn request_device_code(
+    http: &HttpClient,
+    ep: &Endpoints,
+    client_id: &str,
+) -> Result<DeviceCode> {
+    let resp = http
+        .execute(
+            Method::POST,
+            &ep.device_code,
+            Body::Form(&[("client_id", client_id), ("scope", SCOPE)]),
+            None,
+        )
+        .await?;
+    if !resp.is_success() {
+        return Err(unexpected(
+            "Microsoft",
+            format!("HTTP {} requesting a sign-in code", resp.status),
+        ));
+    }
+    let body: DeviceCodeResponse = resp.json()?;
+    if !valid_user_code(&body.user_code) || !valid_verification_uri(&body.verification_uri) {
+        return Err(unexpected(
+            "Microsoft",
+            "sign-in code or address failed validation",
+        ));
+    }
+    Ok(DeviceCode {
+        device_code: SecretString::new(body.device_code),
+        user_code: body.user_code,
+        verification_uri: body.verification_uri,
+        expires_in: Duration::from_secs(body.expires_in.clamp(60, 1800)),
+        interval: Duration::from_secs(body.interval.unwrap_or(5).clamp(1, 30)),
+    })
+}
+
+pub async fn poll_token(
+    http: &HttpClient,
+    ep: &Endpoints,
+    client_id: &str,
+    device_code: &SecretString,
+) -> Result<PollOutcome> {
+    let resp = http
+        .execute(
+            Method::POST,
+            &ep.token,
+            Body::Form(&[
+                ("grant_type", DEVICE_GRANT),
+                ("client_id", client_id),
+                ("device_code", device_code.expose()),
+            ]),
+            None,
+        )
+        .await?;
+    let status = resp.status;
+    let body: TokenResponse = resp.json().map_err(|_| {
+        unexpected(
+            "Microsoft",
+            format!("HTTP {status} from the token endpoint"),
+        )
+    })?;
+
+    if let Some(access) = body.access_token {
+        return Ok(PollOutcome::Tokens(MsTokens {
+            access_token: SecretString::new(access),
+            refresh_token: body.refresh_token.map(SecretString::new),
+        }));
+    }
+    match body.error.as_deref() {
+        Some("authorization_pending") => Ok(PollOutcome::Pending),
+        Some("slow_down") => Ok(PollOutcome::SlowDown),
+        Some("authorization_declined") => Err(AuthError::FlowDeclined.into()),
+        Some("expired_token" | "bad_verification_code") => Err(AuthError::FlowExpired.into()),
+        other => Err(unexpected(
+            "Microsoft",
+            format!("error {}", short(other.unwrap_or("none"))),
+        )),
+    }
+}
+
+pub async fn refresh(
+    http: &HttpClient,
+    ep: &Endpoints,
+    client_id: &str,
+    refresh_token: &SecretString,
+) -> Result<MsTokens> {
+    let resp = http
+        .execute(
+            Method::POST,
+            &ep.token,
+            Body::Form(&[
+                ("grant_type", "refresh_token"),
+                ("client_id", client_id),
+                ("refresh_token", refresh_token.expose()),
+                ("scope", SCOPE),
+            ]),
+            None,
+        )
+        .await?;
+    let status = resp.status;
+    let body: TokenResponse = resp
+        .json()
+        .map_err(|_| unexpected("Microsoft", format!("HTTP {status} refreshing the sign-in")))?;
+
+    if let Some(access) = body.access_token {
+        return Ok(MsTokens {
+            access_token: SecretString::new(access),
+            refresh_token: body.refresh_token.map(SecretString::new),
+        });
+    }
+    match body.error.as_deref() {
+        Some("invalid_grant" | "interaction_required" | "consent_required") => {
+            Err(AuthError::ReauthRequired.into())
+        }
+        other => Err(unexpected(
+            "Microsoft",
+            format!("error {}", short(other.unwrap_or("none"))),
+        )),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn verification_address_validation() {
+        assert!(valid_verification_uri("https://www.microsoft.com/link"));
+        assert!(valid_verification_uri(
+            "https://login.microsoftonline.com/common/oauth2/deviceauth"
+        ));
+        for bad in [
+            "http://www.microsoft.com/link",
+            "https://evil.example/link",
+            "https://www.microsoft.com.evil.net/link",
+            "https://user@www.microsoft.com/link",
+            "javascript:alert(1)",
+            "not a url",
+        ] {
+            assert!(!valid_verification_uri(bad), "accepted {bad}");
+        }
+    }
+
+    #[test]
+    fn user_code_validation() {
+        assert!(valid_user_code("ABCD1234"));
+        assert!(valid_user_code("AB-CD"));
+        assert!(!valid_user_code(""));
+        assert!(!valid_user_code("<script>"));
+        assert!(!valid_user_code(&"A".repeat(33)));
+    }
+}
+
+<<<<<KILN-END>>>>>
+<<<<<KILN-FILE crates/kiln-core/src/auth/secret.rs>>>>>
+use zeroize::{Zeroize, ZeroizeOnDrop};
+
+use crate::redact;
+
+/// A token that can't be printed by accident: `Debug` hides it, it is wiped from memory
+/// when dropped (best effort: copies made by HTTP buffers are outside our control), and it
+/// is registered with the log redactor the moment it exists.
+#[derive(Clone, Zeroize, ZeroizeOnDrop)]
+pub struct SecretString(String);
+
+impl SecretString {
+    pub fn new(value: impl Into<String>) -> Self {
+        let value = value.into();
+        redact::global().register_secret(&value);
+        Self(value)
+    }
+
+    /// The raw value. Use only to build a request or a launch argument.
+    pub fn expose(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Debug for SecretString {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("SecretString([REDACTED])")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn debug_never_shows_the_value() {
+        let s = SecretString::new("super-secret-token-value");
+        assert!(!format!("{s:?}").contains("super-secret"));
+        assert_eq!(s.expose(), "super-secret-token-value");
+    }
+}
+
+<<<<<KILN-END>>>>>
+<<<<<KILN-FILE crates/kiln-core/src/auth/service.rs>>>>>
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+use serde::Serialize;
+use tokio::sync::Notify;
+
+use super::accounts::{self, validate_account_id, Account};
+use super::endpoints::{host_policy, Endpoints};
+use super::error::{unexpected, AuthError};
+use super::keystore::SecretStore;
+use super::minecraft::{self, McLogin, Profile};
+use super::ms::{self, MsTokens, PollOutcome};
+use super::secret::SecretString;
+use super::xbox;
+use crate::db::Db;
+use crate::net::HttpClient;
+use crate::{redact, Error, Result, APP_NAME, APP_VERSION};
+
+/// Refresh a cached Minecraft token this long before it expires.
+const REFRESH_MARGIN: Duration = Duration::from_secs(300);
+
+/// What the UI needs to show while the user signs in on Microsoft's page. The device code
+/// itself stays inside the backend.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct DeviceCodeInfo {
+    pub user_code: String,
+    pub verification_uri: String,
+    pub expires_in: u64,
+}
+
+/// Everything the launch pipeline needs to start the game as this player. Deliberately not
+/// `Serialize` and never sent over IPC.
+#[derive(Clone)]
+pub struct LaunchSession {
+    pub account_id: String,
+    pub username: String,
+    pub access_token: SecretString,
+}
+
+impl std::fmt::Debug for LaunchSession {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("LaunchSession { .. }")
+    }
+}
+
+/// Polling pace. Production uses the server's interval and adds [`Timing::slow_down_step`]
+/// whenever Microsoft asks us to slow down; tests shrink both.
+#[derive(Debug, Clone)]
+pub struct Timing {
+    pub interval_override: Option<Duration>,
+    pub slow_down_step: Duration,
+}
+
+impl Default for Timing {
+    fn default() -> Self {
+        Self {
+            interval_override: None,
+            slow_down_step: Duration::from_secs(5),
+        }
+    }
+}
+
+struct PendingFlow {
+    id: u64,
+    device_code: SecretString,
+    verification_uri: String,
+    expires_at: Instant,
+    interval: Duration,
+    cancel: Arc<Notify>,
+}
+
+#[derive(Default)]
+struct Flows {
+    next_id: u64,
+    current: Option<PendingFlow>,
+}
+
+struct CachedSession {
+    access_token: SecretString,
+    username: String,
+    expires_at: Instant,
+}
+
+fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+fn now_unix() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX))
+}
+
+/// A Microsoft application (client) id is a GUID. Anything else is treated as "not set".
+fn valid_client_id(id: &str) -> bool {
+    id.len() == 36
+        && id.bytes().enumerate().all(|(i, b)| match i {
+            8 | 13 | 18 | 23 => b == b'-',
+            _ => b.is_ascii_hexdigit(),
+        })
+}
+
+/// The client id comes from `KILN_MS_CLIENT_ID` at runtime, or was baked in at build time.
+pub fn client_id_from_env() -> Option<String> {
+    std::env::var("KILN_MS_CLIENT_ID")
+        .ok()
+        .or_else(|| option_env!("KILN_MS_CLIENT_ID").map(str::to_owned))
+        .map(|s| s.trim().to_owned())
+        .filter(|s| valid_client_id(s))
+}
+
+pub struct AuthService {
+    db: Db,
+    http: HttpClient,
+    keys: Arc<dyn SecretStore>,
+    endpoints: Endpoints,
+    client_id: Option<String>,
+    timing: Timing,
+    flows: Mutex<Flows>,
+    sessions: Mutex<HashMap<String, CachedSession>>,
+    /// Serializes refreshes so two launches can't race a rotating refresh token.
+    refresh_lock: tokio::sync::Mutex<()>,
+}
+
+impl std::fmt::Debug for AuthService {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("AuthService { .. }")
+    }
+}
+
+impl AuthService {
+    pub fn new(db: Db, keys: Arc<dyn SecretStore>, client_id: Option<String>) -> Result<Self> {
+        let http = HttpClient::new(&format!("{APP_NAME}/{APP_VERSION}"), host_policy())?;
+        Ok(Self::build(
+            db,
+            http,
+            keys,
+            Endpoints::default(),
+            client_id,
+            Timing::default(),
+        ))
+    }
+
+    fn build(
+        db: Db,
+        http: HttpClient,
+        keys: Arc<dyn SecretStore>,
+        endpoints: Endpoints,
+        client_id: Option<String>,
+        timing: Timing,
+    ) -> Self {
+        Self {
+            db,
+            http,
+            keys,
+            endpoints,
+            client_id: client_id.filter(|id| valid_client_id(id)),
+            timing,
+            flows: Mutex::new(Flows::default()),
+            sessions: Mutex::new(HashMap::new()),
+            refresh_lock: tokio::sync::Mutex::new(()),
+        }
+    }
+
+    /// Register known usernames with the log redactor. Call once at startup.
+    pub async fn init(&self) -> Result<()> {
+        for account in accounts::list(&self.db).await? {
+            redact::global().register_secret(&account.username);
+        }
+        Ok(())
+    }
+
+    fn client_id(&self) -> Result<&str> {
+        self.client_id
+            .as_deref()
+            .ok_or_else(|| AuthError::NotConfigured.into())
+    }
+
+    // ---- keychain access (blocking OS calls run off the async runtime) ----
+
+    async fn keys_get(&self, id: &str) -> Result<Option<Vec<u8>>> {
+        let (keys, id) = (Arc::clone(&self.keys), id.to_owned());
+        tokio::task::spawn_blocking(move || keys.get(&id))
+            .await
+            .map_err(|e| Error::Keychain(e.to_string()))?
+    }
+
+    async fn keys_set(&self, id: &str, secret: &[u8]) -> Result<()> {
+        let (keys, id, secret) = (Arc::clone(&self.keys), id.to_owned(), secret.to_vec());
+        tokio::task::spawn_blocking(move || keys.set(&id, &secret))
+            .await
+            .map_err(|e| Error::Keychain(e.to_string()))?
+    }
+
+    async fn keys_delete(&self, id: &str) -> Result<()> {
+        let (keys, id) = (Arc::clone(&self.keys), id.to_owned());
+        tokio::task::spawn_blocking(move || keys.delete(&id))
+            .await
+            .map_err(|e| Error::Keychain(e.to_string()))?
+    }
+
+    // ---- sign-in (device code flow) ----
+
+    /// Ask Microsoft for a code the user enters on their own device or browser.
+    pub async fn begin_device_flow(&self) -> Result<DeviceCodeInfo> {
+        let client_id = self.client_id()?;
+        let code = ms::request_device_code(&self.http, &self.endpoints, client_id).await?;
+        let info = DeviceCodeInfo {
+            user_code: code.user_code,
+            verification_uri: code.verification_uri.clone(),
+            expires_in: code.expires_in.as_secs(),
+        };
+
+        let mut flows = lock(&self.flows);
+        if let Some(old) = flows.current.take() {
+            old.cancel.notify_one();
+        }
+        flows.next_id += 1;
+        let id = flows.next_id;
+        flows.current = Some(PendingFlow {
+            id,
+            device_code: code.device_code,
+            verification_uri: code.verification_uri,
+            expires_at: Instant::now() + code.expires_in,
+            interval: code.interval,
+            cancel: Arc::new(Notify::new()),
+        });
+        Ok(info)
+    }
+
+    /// The (validated) page where the user enters the code, for the "open in browser" button.
+    pub fn pending_verification_uri(&self) -> Option<String> {
+        lock(&self.flows)
+            .current
+            .as_ref()
+            .map(|f| f.verification_uri.clone())
+    }
+
+    /// Wait for the user to finish signing in, then complete the Xbox and Minecraft steps.
+    /// Returns when the flow succeeds, is declined, expires, or is cancelled.
+    pub async fn poll(&self) -> Result<Account> {
+        let (flow_id, device_code, expires_at, interval, cancel) = {
+            let flows = lock(&self.flows);
+            let f = flows.current.as_ref().ok_or(AuthError::NoPendingFlow)?;
+            (
+                f.id,
+                f.device_code.clone(),
+                f.expires_at,
+                f.interval,
+                Arc::clone(&f.cancel),
+            )
+        };
+        let result = self
+            .poll_loop(&device_code, expires_at, interval, &cancel)
+            .await;
+
+        let mut flows = lock(&self.flows);
+        if flows.current.as_ref().is_some_and(|f| f.id == flow_id) {
+            flows.current = None;
+        }
+        result
+    }
+
+    async fn poll_loop(
+        &self,
+        device_code: &SecretString,
+        expires_at: Instant,
+        interval: Duration,
+        cancel: &Notify,
+    ) -> Result<Account> {
+        let client_id = self.client_id()?;
+        let mut extra = Duration::ZERO;
+        loop {
+            let wait = self.timing.interval_override.unwrap_or(interval) + extra;
+            tokio::select! {
+                () = cancel.notified() => return Err(AuthError::FlowCancelled.into()),
+                () = tokio::time::sleep(wait) => {}
+            }
+            if Instant::now() >= expires_at {
+                return Err(AuthError::FlowExpired.into());
+            }
+            match ms::poll_token(&self.http, &self.endpoints, client_id, device_code).await? {
+                PollOutcome::Tokens(tokens) => return self.finish_sign_in(tokens).await,
+                PollOutcome::Pending => {}
+                PollOutcome::SlowDown => extra += self.timing.slow_down_step,
+            }
+        }
+    }
+
+    /// Abandon the sign-in in progress, if any.
+    pub fn cancel_flow(&self) {
+        if let Some(flow) = lock(&self.flows).current.take() {
+            flow.cancel.notify_one();
+        }
+    }
+
+    async fn minecraft_login(&self, ms_access: &SecretString) -> Result<(McLogin, Profile)> {
+        let xbl = xbox::authenticate(&self.http, &self.endpoints, ms_access).await?;
+        let xsts = xbox::authorize_xsts(&self.http, &self.endpoints, &xbl).await?;
+        let login = minecraft::login_with_xbox(&self.http, &self.endpoints, &xsts).await?;
+        let profile =
+            minecraft::fetch_profile(&self.http, &self.endpoints, &login.access_token).await?;
+        Ok((login, profile))
+    }
+
+    fn cache_session(&self, profile: &Profile, login: &McLogin) {
+        redact::global().register_secret(&profile.name);
+        lock(&self.sessions).insert(
+            profile.id.clone(),
+            CachedSession {
+                access_token: login.access_token.clone(),
+                username: profile.name.clone(),
+                expires_at: Instant::now() + login.expires_in,
+            },
+        );
+    }
+
+    async fn finish_sign_in(&self, tokens: MsTokens) -> Result<Account> {
+        let refresh = tokens
+            .refresh_token
+            .ok_or_else(|| unexpected("Microsoft", "no refresh token was issued"))?;
+        // Ownership is checked here: a missing profile aborts before anything is stored.
+        let (login, profile) = self.minecraft_login(&tokens.access_token).await?;
+
+        // Keychain first: if it fails, no account row is created.
+        self.keys_set(&profile.id, refresh.expose().as_bytes())
+            .await?;
+        let account = accounts::upsert_signed_in(&self.db, &profile, now_unix()).await?;
+        self.cache_session(&profile, &login);
+        tracing::info!("signed in to a Minecraft account");
+        Ok(account)
+    }
+
+    // ---- sessions for launching ----
+
+    fn cached(&self, id: &str) -> Option<LaunchSession> {
+        let sessions = lock(&self.sessions);
+        let s = sessions.get(id)?;
+        (s.expires_at > Instant::now() + REFRESH_MARGIN).then(|| LaunchSession {
+            account_id: id.to_owned(),
+            username: s.username.clone(),
+            access_token: s.access_token.clone(),
+        })
+    }
+
+    /// A valid Minecraft session for this account, refreshing through Microsoft if the
+    /// cached one is missing or about to expire. Only the launch pipeline calls this.
+    pub async fn session_for_launch(&self, account_id: &str) -> Result<LaunchSession> {
+        validate_account_id(account_id)?;
+        if let Some(session) = self.cached(account_id) {
+            return Ok(session);
+        }
+        let _guard = self.refresh_lock.lock().await;
+        // Another task may have refreshed while we waited.
+        if let Some(session) = self.cached(account_id) {
+            return Ok(session);
+        }
+        self.refresh_account(account_id).await
+    }
+
+    async fn refresh_account(&self, id: &str) -> Result<LaunchSession> {
+        let client_id = self.client_id()?;
+        if accounts::get(&self.db, id).await?.is_none() {
+            return Err(AuthError::AccountNotFound.into());
+        }
+        let stored = self
+            .keys_get(id)
+            .await?
+            .and_then(|raw| String::from_utf8(raw).ok());
+        let Some(stored) = stored else {
+            accounts::mark_needs_reauth(&self.db, id).await?;
+            return Err(AuthError::ReauthRequired.into());
+        };
+
+        let tokens = match ms::refresh(
+            &self.http,
+            &self.endpoints,
+            client_id,
+            &SecretString::new(stored),
+        )
+        .await
+        {
+            Ok(tokens) => tokens,
+            Err(e @ Error::Auth(AuthError::ReauthRequired)) => {
+                accounts::mark_needs_reauth(&self.db, id).await?;
+                return Err(e);
+            }
+            Err(e) => return Err(e),
+        };
+        if let Some(rotated) = &tokens.refresh_token {
+            self.keys_set(id, rotated.expose().as_bytes()).await?;
+        }
+
+        let (login, profile) = self.minecraft_login(&tokens.access_token).await?;
+        if profile.id != id {
+            return Err(unexpected(
+                "Minecraft",
+                "the refreshed profile belongs to a different account",
+            ));
+        }
+        accounts::update_profile(&self.db, &profile).await?;
+        self.cache_session(&profile, &login);
+        Ok(LaunchSession {
+            account_id: id.to_owned(),
+            username: profile.name,
+            access_token: login.access_token,
+        })
+    }
+
+    // ---- account management ----
+
+    pub async fn list_accounts(&self) -> Result<Vec<Account>> {
+        accounts::list(&self.db).await
+    }
+
+    pub async fn set_active(&self, id: &str) -> Result<Account> {
+        validate_account_id(id)?;
+        accounts::set_active(&self.db, id, now_unix()).await
+    }
+
+    /// Remove an account and its stored sign-in. The keychain entry goes first: if that
+    /// fails the account stays listed so the user can retry, instead of leaving an
+    /// orphaned secret behind.
+    pub async fn remove_account(&self, id: &str) -> Result<()> {
+        validate_account_id(id)?;
+        if accounts::get(&self.db, id).await?.is_none() {
+            return Err(AuthError::AccountNotFound.into());
+        }
+        self.keys_delete(id).await?;
+        accounts::remove(&self.db, id).await?;
+        lock(&self.sessions).remove(id);
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+impl AuthService {
+    fn for_tests(
+        db: Db,
+        keys: Arc<dyn SecretStore>,
+        base_url: &str,
+        client_id: Option<&str>,
+    ) -> Self {
+        use crate::net::HostPolicy;
+        let http =
+            HttpClient::new("Kiln-test/0", HostPolicy::new(&[]).with_loopback_http()).unwrap();
+        Self::build(
+            db,
+            http,
+            keys,
+            Endpoints::with_base(base_url),
+            client_id.map(str::to_owned),
+            Timing {
+                interval_override: Some(Duration::from_millis(5)),
+                slow_down_step: Duration::from_millis(10),
+            },
+        )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::Write;
+
+    use serde_json::json;
+    use tracing_subscriber::fmt::MakeWriter;
+    use wiremock::matchers::{body_string_contains, header, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    use super::*;
+    use crate::auth::keystore::MemoryStore;
+    use crate::db;
+
+    const CLIENT_ID: &str = "00000000-1111-2222-3333-444444444444";
+    const DEVICE_CODE: &str = "DEVICECODE-SECRET-123456";
+    const MS_ACCESS: &str = "MS-ACCESS-TOKEN-SECRET";
+    const REFRESH_1: &str = "REFRESH-TOKEN-SECRET-1";
+    const REFRESH_2: &str = "REFRESH-TOKEN-SECRET-2";
+    const XBL: &str = "XBL-TOKEN-SECRET-abcdef";
+    const XSTS: &str = "XSTS-TOKEN-SECRET-abcdef";
+    const MC: &str = "MC-ACCESS-TOKEN-SECRET-xyz";
+    const PLAYER_ID: &str = "069a79f44e9d4e9cb12bd4a2bb7d6fd4";
+    const PLAYER_NAME: &str = "Steve_Test";
+    const SECRETS: [&str; 7] = [DEVICE_CODE, MS_ACCESS, REFRESH_1, REFRESH_2, XBL, XSTS, MC];
+
+    fn skin_hash() -> String {
+        "0123456789abcdef".repeat(4)
+    }
+
+    struct Harness {
+        svc: Arc<AuthService>,
+        server: MockServer,
+        keys: Arc<MemoryStore>,
+        db: Db,
+    }
+
+    impl Harness {
+        async fn new() -> Self {
+            Self::with_db(db::open_in_memory().await.unwrap()).await
+        }
+
+        async fn with_db(db: Db) -> Self {
+            let server = MockServer::start().await;
+            let keys = Arc::new(MemoryStore::default());
+            let svc = Arc::new(AuthService::for_tests(
+                db.clone(),
+                keys.clone(),
+                &server.uri(),
+                Some(CLIENT_ID),
+            ));
+            Self {
+                svc,
+                server,
+                keys,
+                db,
+            }
+        }
+
+        async fn mount_device_start(&self, verification_uri: &str) {
+            Mock::given(method("POST"))
+                .and(path("/devicecode"))
+                .and(body_string_contains(CLIENT_ID))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                    "device_code": DEVICE_CODE,
+                    "user_code": "ABCD1234",
+                    "verification_uri": verification_uri,
+                    "expires_in": 900,
+                    "interval": 5,
+                })))
+                .mount(&self.server)
+                .await;
+        }
+
+        async fn mount_device_token_error(&self, error: &str, times: Option<u64>, priority: u8) {
+            let mock = Mock::given(method("POST"))
+                .and(path("/token"))
+                .and(body_string_contains(format!("device_code={DEVICE_CODE}")))
+                .respond_with(ResponseTemplate::new(400).set_body_json(json!({ "error": error })))
+                .with_priority(priority);
+            match times {
+                Some(n) => mock.up_to_n_times(n).mount(&self.server).await,
+                None => mock.mount(&self.server).await,
+            }
+        }
+
+        async fn mount_device_token_success(&self, priority: u8) {
+            Mock::given(method("POST"))
+                .and(path("/token"))
+                .and(body_string_contains(format!("device_code={DEVICE_CODE}")))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                    "access_token": MS_ACCESS, "refresh_token": REFRESH_1, "expires_in": 3600,
+                })))
+                .with_priority(priority)
+                .mount(&self.server)
+                .await;
+        }
+
+        async fn mount_chain(&self) {
+            Mock::given(method("POST"))
+                .and(path("/xbl"))
+                .and(body_string_contains(format!("d={MS_ACCESS}")))
+                .respond_with(ResponseTemplate::new(200).set_body_json(
+                    json!({"Token": XBL, "DisplayClaims": {"xui": [{"uhs": "1234567890"}]}}),
+                ))
+                .mount(&self.server)
+                .await;
+            self.mount_xsts_ok().await;
+            Mock::given(method("POST"))
+                .and(path("/mclogin"))
+                .and(body_string_contains(format!("XBL3.0 x=1234567890;{XSTS}")))
+                .respond_with(ResponseTemplate::new(200).set_body_json(
+                    json!({"access_token": MC, "expires_in": 86400, "token_type": "Bearer"}),
+                ))
+                .mount(&self.server)
+                .await;
+            self.mount_profile(PLAYER_NAME).await;
+        }
+
+        async fn mount_xsts_ok(&self) {
+            Mock::given(method("POST"))
+                .and(path("/xsts"))
+                .and(body_string_contains(XBL))
+                .respond_with(ResponseTemplate::new(200).set_body_json(
+                    json!({"Token": XSTS, "DisplayClaims": {"xui": [{"uhs": "1234567890"}]}}),
+                ))
+                .mount(&self.server)
+                .await;
+        }
+
+        async fn mount_profile(&self, name: &str) {
+            Mock::given(method("GET"))
+                .and(path("/profile"))
+                .and(header("authorization", format!("Bearer {MC}").as_str()))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                    "id": PLAYER_ID,
+                    "name": name,
+                    "skins": [{"state": "ACTIVE", "variant": "SLIM",
+                               "url": format!("http://textures.minecraft.net/texture/{}", skin_hash())}],
+                    "capes": [],
+                })))
+                .mount(&self.server)
+                .await;
+        }
+
+        async fn mount_happy_path(&self) {
+            self.mount_device_start("https://www.microsoft.com/link")
+                .await;
+            self.mount_device_token_error("authorization_pending", Some(2), 1)
+                .await;
+            self.mount_device_token_success(2).await;
+            self.mount_chain().await;
+        }
+
+        async fn sign_in(&self) -> Result<Account> {
+            self.svc.begin_device_flow().await?;
+            self.svc.poll().await
+        }
+
+        async fn count(&self, p: &str, needle: &str) -> usize {
+            self.server
+                .received_requests()
+                .await
+                .unwrap()
+                .iter()
+                .filter(|r| r.url.path() == p && String::from_utf8_lossy(&r.body).contains(needle))
+                .count()
+        }
+    }
+
+    #[derive(Clone, Default)]
+    struct LogBuf(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for LogBuf {
+        fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(data);
+            Ok(data.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> MakeWriter<'a> for LogBuf {
+        type Writer = LogBuf;
+        fn make_writer(&'a self) -> LogBuf {
+            self.clone()
+        }
+    }
+
+    /// Capture every event from every crate at TRACE, with NO redaction, so tests prove the
+    /// code never emits a secret rather than relying on the redactor to hide it.
+    fn capture_logs() -> (tracing::subscriber::DefaultGuard, LogBuf) {
+        let buf = LogBuf::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_max_level(tracing::Level::TRACE)
+            .with_writer(buf.clone())
+            .finish();
+        (tracing::subscriber::set_default(subscriber), buf)
+    }
+
+    fn contains(haystack: &[u8], needle: &[u8]) -> bool {
+        haystack.windows(needle.len()).any(|w| w == needle)
+    }
+
+    #[tokio::test]
+    async fn sign_in_stores_the_refresh_token_only_in_the_keychain_and_never_logs_secrets() {
+        let (_guard, logs) = capture_logs();
+        let dir = tempfile::tempdir().unwrap();
+        let db = db::open(&dir.path().join("kiln.sqlite")).await.unwrap();
+        let h = Harness::with_db(db).await;
+        h.mount_happy_path().await;
+
+        let account = h.sign_in().await.unwrap();
+        assert_eq!(account.id, PLAYER_ID);
+        assert_eq!(account.username, PLAYER_NAME);
+        assert!(account.is_active && !account.needs_reauth);
+        assert_eq!(
+            account.skin_url.as_deref(),
+            Some(format!("https://textures.minecraft.net/texture/{}", skin_hash()).as_str())
+        );
+
+        // The refresh token is in the keychain, byte for byte.
+        let stored = h.keys.snapshot();
+        assert_eq!(
+            stored.get(PLAYER_ID).map(Vec::as_slice),
+            Some(REFRESH_1.as_bytes())
+        );
+        assert_eq!(stored.len(), 1);
+
+        // No token appears anywhere in the database files.
+        h.db.close().await;
+        let mut db_bytes = Vec::new();
+        for entry in std::fs::read_dir(dir.path()).unwrap() {
+            db_bytes.extend(std::fs::read(entry.unwrap().path()).unwrap());
+        }
+        for secret in SECRETS {
+            assert!(
+                !contains(&db_bytes, secret.as_bytes()),
+                "{secret} found in database files"
+            );
+        }
+
+        // No token (and no username) appears in raw, unredacted logs.
+        let logs = String::from_utf8(logs.0.lock().unwrap().clone()).unwrap();
+        assert!(
+            logs.contains("signed in"),
+            "log capture is not working: {logs}"
+        );
+        for secret in SECRETS.iter().copied().chain([PLAYER_NAME]) {
+            assert!(!logs.contains(secret), "{secret} found in logs:\n{logs}");
+        }
+    }
+
+    #[tokio::test]
+    async fn polling_survives_pending_and_slow_down() {
+        let h = Harness::new().await;
+        h.mount_device_start("https://www.microsoft.com/link").await;
+        h.mount_device_token_error("slow_down", Some(1), 1).await;
+        h.mount_device_token_error("authorization_pending", Some(1), 2)
+            .await;
+        h.mount_device_token_success(3).await;
+        h.mount_chain().await;
+
+        h.sign_in().await.unwrap();
+        assert_eq!(h.count("/token", "device_code=").await, 3);
+    }
+
+    #[tokio::test]
+    async fn declined_and_expired_codes_report_specific_errors() {
+        for (server_error, expect_declined) in
+            [("authorization_declined", true), ("expired_token", false)]
+        {
+            let h = Harness::new().await;
+            h.mount_device_start("https://www.microsoft.com/link").await;
+            h.mount_device_token_error(server_error, None, 1).await;
+            let err = h.sign_in().await.unwrap_err();
+            if expect_declined {
+                assert!(
+                    matches!(err, Error::Auth(AuthError::FlowDeclined)),
+                    "{err:?}"
+                );
+            } else {
+                assert!(
+                    matches!(err, Error::Auth(AuthError::FlowExpired)),
+                    "{err:?}"
+                );
+            }
+            assert!(h.svc.list_accounts().await.unwrap().is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn cancelling_stops_the_poll_and_clears_the_flow() {
+        let h = Harness::new().await;
+        h.mount_device_start("https://www.microsoft.com/link").await;
+        h.mount_device_token_error("authorization_pending", None, 1)
+            .await;
+        h.svc.begin_device_flow().await.unwrap();
+        assert_eq!(
+            h.svc.pending_verification_uri().as_deref(),
+            Some("https://www.microsoft.com/link")
+        );
+
+        let poller = tokio::spawn({
+            let svc = Arc::clone(&h.svc);
+            async move { svc.poll().await }
+        });
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        h.svc.cancel_flow();
+
+        let result = tokio::time::timeout(Duration::from_secs(5), poller)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(result, Err(Error::Auth(AuthError::FlowCancelled))));
+        assert!(h.svc.pending_verification_uri().is_none());
+        assert!(matches!(
+            h.svc.poll().await,
+            Err(Error::Auth(AuthError::NoPendingFlow))
+        ));
+    }
+
+    #[tokio::test]
+    async fn starting_a_new_flow_cancels_the_old_one() {
+        let h = Harness::new().await;
+        h.mount_device_start("https://www.microsoft.com/link").await;
+        h.mount_device_token_error("authorization_pending", None, 1)
+            .await;
+        h.svc.begin_device_flow().await.unwrap();
+        let first = tokio::spawn({
+            let svc = Arc::clone(&h.svc);
+            async move { svc.poll().await }
+        });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        h.svc.begin_device_flow().await.unwrap();
+
+        let result = tokio::time::timeout(Duration::from_secs(5), first)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(result, Err(Error::Auth(AuthError::FlowCancelled))));
+        // The newer flow is still pending.
+        assert!(h.svc.pending_verification_uri().is_some());
+    }
+
+    #[tokio::test]
+    async fn unconfigured_builds_say_so() {
+        let server = MockServer::start().await;
+        let db = db::open_in_memory().await.unwrap();
+        for id in [None, Some("not-a-guid"), Some("")] {
+            let svc = AuthService::for_tests(
+                db.clone(),
+                Arc::new(MemoryStore::default()),
+                &server.uri(),
+                id,
+            );
+            let err = svc.begin_device_flow().await.unwrap_err();
+            assert!(
+                matches!(err, Error::Auth(AuthError::NotConfigured)),
+                "{id:?}: {err:?}"
+            );
+        }
+        assert!(server.received_requests().await.unwrap().is_empty());
+    }
+
+    #[test]
+    fn client_id_must_be_a_guid() {
+        assert!(valid_client_id(CLIENT_ID));
+        assert!(valid_client_id("AAAAAAAA-BBBB-CCCC-DDDD-EEEEEEEEEEEE"));
+        for bad in [
+            "",
+            "abc",
+            "00000000111122223333444444444444",
+            "0000000g-1111-2222-3333-444444444444",
+            "00000000-1111-2222-3333-4444444444444",
+        ] {
+            assert!(!valid_client_id(bad), "accepted {bad:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_verification_address_outside_microsoft_is_refused() {
+        let h = Harness::new().await;
+        h.mount_device_start("https://evil.example/login").await;
+        let err = h.svc.begin_device_flow().await.unwrap_err();
+        assert!(
+            matches!(err, Error::Auth(AuthError::Unexpected { .. })),
+            "{err:?}"
+        );
+        assert!(h.svc.pending_verification_uri().is_none());
+    }
+
+    #[tokio::test]
+    async fn xsts_failures_map_to_plain_explanations() {
+        type Check = fn(&AuthError) -> bool;
+        let cases: [(u64, Check); 4] = [
+            (2_148_916_233, |e| matches!(e, AuthError::XboxNoAccount)),
+            (2_148_916_235, |e| matches!(e, AuthError::XboxRegionBlocked)),
+            (2_148_916_236, |e| {
+                matches!(e, AuthError::XboxAdultVerification)
+            }),
+            (2_148_916_238, |e| matches!(e, AuthError::XboxChildAccount)),
+        ];
+        for (code, is_expected) in cases {
+            let h = Harness::new().await;
+            h.mount_device_start("https://www.microsoft.com/link").await;
+            h.mount_device_token_success(1).await;
+            Mock::given(method("POST"))
+                .and(path("/xbl"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(
+                    json!({"Token": XBL, "DisplayClaims": {"xui": [{"uhs": "1234567890"}]}}),
+                ))
+                .mount(&h.server)
+                .await;
+            Mock::given(method("POST"))
+                .and(path("/xsts"))
+                .respond_with(
+                    ResponseTemplate::new(401).set_body_json(json!({"XErr": code, "Message": ""})),
+                )
+                .mount(&h.server)
+                .await;
+
+            match h.sign_in().await.unwrap_err() {
+                Error::Auth(e) => assert!(is_expected(&e), "{code}: {e:?}"),
+                other => panic!("{code}: {other:?}"),
+            }
+            assert!(h.keys.snapshot().is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn accounts_without_minecraft_are_rejected_and_nothing_is_stored() {
+        let h = Harness::new().await;
+        h.mount_device_start("https://www.microsoft.com/link").await;
+        h.mount_device_token_success(1).await;
+        h.mount_chain().await;
+        // Replace the profile with a 404 ("no game"): wiremock matches the newest mock first.
+        Mock::given(method("GET"))
+            .and(path("/profile"))
+            .respond_with(ResponseTemplate::new(404).set_body_json(json!({"error": "NOT_FOUND"})))
+            .with_priority(1)
+            .mount(&h.server)
+            .await;
+
+        let err = h.sign_in().await.unwrap_err();
+        assert!(
+            matches!(err, Error::Auth(AuthError::NoGameOwnership)),
+            "{err:?}"
+        );
+        assert!(h.svc.list_accounts().await.unwrap().is_empty());
+        assert!(
+            h.keys.snapshot().is_empty(),
+            "nothing may reach the keychain without ownership"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unapproved_app_registration_is_reported_clearly() {
+        let h = Harness::new().await;
+        h.mount_device_start("https://www.microsoft.com/link").await;
+        h.mount_device_token_success(1).await;
+        h.mount_chain().await;
+        Mock::given(method("POST"))
+            .and(path("/mclogin"))
+            .respond_with(ResponseTemplate::new(403).set_body_json(json!({
+                "errorMessage": "Invalid app registration, see https://aka.ms/AppRegInfo"
+            })))
+            .with_priority(1)
+            .mount(&h.server)
+            .await;
+
+        let err = h.sign_in().await.unwrap_err();
+        assert!(
+            matches!(err, Error::Auth(AuthError::AppNotApproved)),
+            "{err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn launch_sessions_are_cached_then_refreshed_and_the_rotated_token_is_stored() {
+        let h = Harness::new().await;
+        h.mount_happy_path().await;
+        h.sign_in().await.unwrap();
+
+        // Fresh cache: no refresh call is made.
+        let s = h.svc.session_for_launch(PLAYER_ID).await.unwrap();
+        assert_eq!(s.access_token.expose(), MC);
+        assert_eq!(s.username, PLAYER_NAME);
+        assert_eq!(h.count("/token", "grant_type=refresh_token").await, 0);
+        assert!(!format!("{s:?}").contains(MC));
+
+        // Expire the cache; Microsoft rotates the refresh token and the player renamed.
+        lock(&h.svc.sessions).clear();
+        Mock::given(method("POST"))
+            .and(path("/token"))
+            .and(body_string_contains(format!("refresh_token={REFRESH_1}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "access_token": MS_ACCESS, "refresh_token": REFRESH_2, "expires_in": 3600,
+            })))
+            .mount(&h.server)
+            .await;
+        h.mount_profile("Steve_Renamed").await;
+        Mock::given(method("GET"))
+            .and(path("/profile"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": PLAYER_ID, "name": "Steve_Renamed", "skins": [], "capes": [],
+            })))
+            .with_priority(1)
+            .mount(&h.server)
+            .await;
+
+        let s = h.svc.session_for_launch(PLAYER_ID).await.unwrap();
+        assert_eq!(s.username, "Steve_Renamed");
+        assert_eq!(h.count("/token", "grant_type=refresh_token").await, 1);
+        assert_eq!(
+            h.keys.snapshot().get(PLAYER_ID).map(Vec::as_slice),
+            Some(REFRESH_2.as_bytes())
+        );
+        assert_eq!(
+            h.svc.list_accounts().await.unwrap()[0].username,
+            "Steve_Renamed"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_revoked_refresh_token_flags_the_account_but_keeps_it() {
+        let h = Harness::new().await;
+        h.mount_happy_path().await;
+        h.sign_in().await.unwrap();
+        lock(&h.svc.sessions).clear();
+        Mock::given(method("POST"))
+            .and(path("/token"))
+            .and(body_string_contains("grant_type=refresh_token"))
+            .respond_with(
+                ResponseTemplate::new(400).set_body_json(json!({"error": "invalid_grant"})),
+            )
+            .mount(&h.server)
+            .await;
+
+        let err = h.svc.session_for_launch(PLAYER_ID).await.unwrap_err();
+        assert!(
+            matches!(err, Error::Auth(AuthError::ReauthRequired)),
+            "{err:?}"
+        );
+        let accounts = h.svc.list_accounts().await.unwrap();
+        assert_eq!(accounts.len(), 1);
+        assert!(accounts[0].needs_reauth);
+    }
+
+    #[tokio::test]
+    async fn a_missing_keychain_entry_requires_signing_in_again() {
+        let h = Harness::new().await;
+        h.mount_happy_path().await;
+        h.sign_in().await.unwrap();
+        lock(&h.svc.sessions).clear();
+        h.keys.delete(PLAYER_ID).unwrap(); // e.g. the user wiped their keychain
+
+        let err = h.svc.session_for_launch(PLAYER_ID).await.unwrap_err();
+        assert!(
+            matches!(err, Error::Auth(AuthError::ReauthRequired)),
+            "{err:?}"
+        );
+        assert!(h.svc.list_accounts().await.unwrap()[0].needs_reauth);
+        assert_eq!(
+            h.count("/token", "grant_type=refresh_token").await,
+            0,
+            "no network call without a token"
+        );
+    }
+
+    struct BrokenKeychain;
+
+    impl SecretStore for BrokenKeychain {
+        fn set(&self, _: &str, _: &[u8]) -> Result<()> {
+            Err(Error::Keychain("locked".into()))
+        }
+        fn get(&self, _: &str) -> Result<Option<Vec<u8>>> {
+            Err(Error::Keychain("locked".into()))
+        }
+        fn delete(&self, _: &str) -> Result<()> {
+            Err(Error::Keychain("locked".into()))
+        }
+    }
+
+    #[tokio::test]
+    async fn if_the_keychain_fails_no_account_is_created() {
+        let server = MockServer::start().await;
+        let db = db::open_in_memory().await.unwrap();
+        let svc =
+            AuthService::for_tests(db, Arc::new(BrokenKeychain), &server.uri(), Some(CLIENT_ID));
+        let h = Harness {
+            svc: Arc::new(svc),
+            server,
+            keys: Arc::new(MemoryStore::default()),
+            db: db::open_in_memory().await.unwrap(),
+        };
+        h.mount_happy_path().await;
+
+        let err = h.sign_in().await.unwrap_err();
+        assert!(matches!(err, Error::Keychain(_)), "{err:?}");
+        assert!(h.svc.list_accounts().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn removing_an_account_deletes_its_keychain_entry_and_promotes_another() {
+        let h = Harness::new().await;
+        let (a, b) = ("a".repeat(32), "b".repeat(32));
+        for (id, name, t) in [(&a, "Alex", 100), (&b, "Bea", 200)] {
+            let profile = Profile {
+                id: id.clone(),
+                name: name.into(),
+                skin_hash: None,
+                skin_variant: None,
+                cape_hash: None,
+            };
+            accounts::upsert_signed_in(&h.db, &profile, t)
+                .await
+                .unwrap();
+            h.keys.set(id, b"token").unwrap();
+        }
+
+        h.svc.remove_account(&b).await.unwrap();
+        assert!(!h.keys.snapshot().contains_key(&b));
+        assert!(h.keys.snapshot().contains_key(&a));
+        let remaining = h.svc.list_accounts().await.unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert!(remaining[0].is_active, "the remaining account is promoted");
+
+        assert!(matches!(
+            h.svc.remove_account(&b).await,
+            Err(Error::Auth(AuthError::AccountNotFound))
+        ));
+        assert!(matches!(
+            h.svc.remove_account("../etc").await,
+            Err(Error::Auth(AuthError::InvalidAccountId))
+        ));
+        assert!(matches!(
+            h.svc.set_active("nope").await,
+            Err(Error::Auth(AuthError::InvalidAccountId))
+        ));
+        assert!(matches!(
+            h.svc.session_for_launch("nope").await,
+            Err(Error::Auth(AuthError::InvalidAccountId))
+        ));
+    }
+
+    #[tokio::test]
+    async fn if_the_keychain_cannot_delete_the_account_stays_listed() {
+        let server = MockServer::start().await;
+        let db = db::open_in_memory().await.unwrap();
+        let id = "c".repeat(32);
+        let profile = Profile {
+            id: id.clone(),
+            name: "Cy".into(),
+            skin_hash: None,
+            skin_variant: None,
+            cape_hash: None,
+        };
+        accounts::upsert_signed_in(&db, &profile, 1).await.unwrap();
+        let svc =
+            AuthService::for_tests(db, Arc::new(BrokenKeychain), &server.uri(), Some(CLIENT_ID));
+
+        assert!(matches!(
+            svc.remove_account(&id).await,
+            Err(Error::Keychain(_))
+        ));
+        assert_eq!(svc.list_accounts().await.unwrap().len(), 1);
+    }
+}
+
+<<<<<KILN-END>>>>>
+<<<<<KILN-FILE crates/kiln-core/src/auth/xbox.rs>>>>>
+//! Xbox Live user token and XSTS authorization for the Minecraft relying party.
+
+use reqwest::Method;
+use serde::Deserialize;
+use serde_json::json;
+
+use super::endpoints::Endpoints;
+use super::error::{unexpected, AuthError};
+use super::secret::SecretString;
+use crate::net::{Body, HttpClient};
+use crate::Result;
+
+pub struct XboxToken {
+    pub token: SecretString,
+    /// "User hash": identifies the Xbox user inside the Minecraft identity token.
+    pub uhs: String,
+}
+
+#[derive(Deserialize)]
+struct XboxResponse {
+    #[serde(rename = "Token")]
+    token: String,
+    #[serde(rename = "DisplayClaims")]
+    claims: Claims,
+}
+
+#[derive(Deserialize)]
+struct Claims {
+    xui: Vec<Xui>,
+}
+
+#[derive(Deserialize)]
+struct Xui {
+    uhs: String,
+}
+
+#[derive(Deserialize)]
+struct XstsError {
+    #[serde(rename = "XErr")]
+    code: Option<u64>,
+}
+
+fn parse(resp: &crate::net::HttpResponse, what: &str) -> Result<XboxToken> {
+    let body: XboxResponse = resp.json()?;
+    let uhs = body
+        .claims
+        .xui
+        .into_iter()
+        .next()
+        .map(|x| x.uhs)
+        .filter(|u| (1..=64).contains(&u.len()) && u.bytes().all(|b| b.is_ascii_alphanumeric()))
+        .ok_or_else(|| unexpected("Xbox", format!("{what} response had no valid user hash")))?;
+    Ok(XboxToken {
+        token: SecretString::new(body.token),
+        uhs,
+    })
+}
+
+pub async fn authenticate(
+    http: &HttpClient,
+    ep: &Endpoints,
+    ms_access: &SecretString,
+) -> Result<XboxToken> {
+    let body = json!({
+        "Properties": {
+            "AuthMethod": "RPS",
+            "SiteName": "user.auth.xboxlive.com",
+            "RpsTicket": format!("d={}", ms_access.expose()),
+        },
+        "RelyingParty": "http://auth.xboxlive.com",
+        "TokenType": "JWT",
+    });
+    let resp = http
+        .execute(Method::POST, &ep.xbox_user_auth, Body::Json(&body), None)
+        .await?;
+    if !resp.is_success() {
+        return Err(unexpected(
+            "Xbox",
+            format!("HTTP {} from user authentication", resp.status),
+        ));
+    }
+    parse(&resp, "user authentication")
+}
+
+pub async fn authorize_xsts(
+    http: &HttpClient,
+    ep: &Endpoints,
+    user: &XboxToken,
+) -> Result<XboxToken> {
+    let body = json!({
+        "Properties": {
+            "SandboxId": "RETAIL",
+            "UserTokens": [user.token.expose()],
+        },
+        "RelyingParty": "rp://api.minecraftservices.com/",
+        "TokenType": "JWT",
+    });
+    let resp = http
+        .execute(Method::POST, &ep.xsts, Body::Json(&body), None)
+        .await?;
+    if resp.status == 401 {
+        let code = resp.json::<XstsError>().ok().and_then(|e| e.code);
+        return Err(map_xsts_error(code).into());
+    }
+    if !resp.is_success() {
+        return Err(unexpected(
+            "Xbox",
+            format!("HTTP {} from XSTS", resp.status),
+        ));
+    }
+    parse(&resp, "XSTS")
+}
+
+/// <https://wiki.vg/Microsoft_Authentication_Scheme> documents these `XErr` codes.
+fn map_xsts_error(code: Option<u64>) -> AuthError {
+    match code {
+        Some(2_148_916_233) => AuthError::XboxNoAccount,
+        Some(2_148_916_235) => AuthError::XboxRegionBlocked,
+        Some(2_148_916_236 | 2_148_916_237) => AuthError::XboxAdultVerification,
+        Some(2_148_916_238) => AuthError::XboxChildAccount,
+        Some(other) => AuthError::XboxOther(other),
+        None => AuthError::XboxOther(0),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn xsts_codes_map_to_specific_errors() {
+        assert!(matches!(
+            map_xsts_error(Some(2_148_916_233)),
+            AuthError::XboxNoAccount
+        ));
+        assert!(matches!(
+            map_xsts_error(Some(2_148_916_235)),
+            AuthError::XboxRegionBlocked
+        ));
+        assert!(matches!(
+            map_xsts_error(Some(2_148_916_236)),
+            AuthError::XboxAdultVerification
+        ));
+        assert!(matches!(
+            map_xsts_error(Some(2_148_916_237)),
+            AuthError::XboxAdultVerification
+        ));
+        assert!(matches!(
+            map_xsts_error(Some(2_148_916_238)),
+            AuthError::XboxChildAccount
+        ));
+        assert!(matches!(map_xsts_error(Some(42)), AuthError::XboxOther(42)));
+        assert!(matches!(map_xsts_error(None), AuthError::XboxOther(0)));
+    }
+}
+
+<<<<<KILN-END>>>>>
+<<<<<KILN-FILE crates/kiln-core/src/net/mod.rs>>>>>
+//! The only HTTP client in Kiln. It speaks HTTPS only, refuses any host that isn't on an
+//! explicit allowlist, never follows redirects on its own, caps response sizes, and never
+//! logs URLs beyond host and path or any request or response body.
+
+use std::sync::Once;
+use std::time::Duration;
+
+use reqwest::{Method, Url};
+use serde::de::DeserializeOwned;
+
+use crate::{Error, Result};
+
+/// Largest response body accepted by [`HttpClient::execute`].
+pub const MAX_RESPONSE_BYTES: usize = 2 * 1024 * 1024;
+
+/// Which hosts a client may talk to. Entries are exact host names, or start with `.` to
+/// also allow subdomains (`.example.com` matches `example.com` and `a.example.com`, but
+/// not `badexample.com` or `example.com.evil.net`).
+#[derive(Debug, Clone)]
+pub struct HostPolicy {
+    allowed: Vec<String>,
+    #[cfg(test)]
+    loopback_http: bool,
+}
+
+fn host_matches(host: &str, entry: &str) -> bool {
+    match entry.strip_prefix('.') {
+        Some(bare) => host == bare || host.ends_with(entry),
+        None => host == entry,
+    }
+}
+
+impl HostPolicy {
+    pub fn new(allowed: &[&str]) -> Self {
+        Self {
+            allowed: allowed.iter().map(|h| h.to_ascii_lowercase()).collect(),
+            #[cfg(test)]
+            loopback_http: false,
+        }
+    }
+
+    /// Test-only: also allow plain HTTP to a loopback mock server.
+    #[cfg(test)]
+    pub fn with_loopback_http(mut self) -> Self {
+        self.loopback_http = true;
+        self
+    }
+
+    fn loopback_http_enabled(&self) -> bool {
+        #[cfg(test)]
+        {
+            self.loopback_http
+        }
+        #[cfg(not(test))]
+        {
+            false
+        }
+    }
+
+    pub fn check(&self, url: &Url) -> Result<()> {
+        let deny =
+            |why: &str| Error::HostNotAllowed(format!("{} ({why})", url.host_str().unwrap_or("?")));
+        let host = url.host_str().ok_or_else(|| deny("no host"))?;
+
+        if self.loopback_http_enabled()
+            && url.scheme() == "http"
+            && matches!(host, "127.0.0.1" | "localhost")
+        {
+            return Ok(());
+        }
+        if url.scheme() != "https" {
+            return Err(deny("not HTTPS"));
+        }
+        if !url.username().is_empty() || url.password().is_some() {
+            return Err(deny("credentials in URL"));
+        }
+        if url.port().is_some_and(|p| p != 443) {
+            return Err(deny("unexpected port"));
+        }
+        if self.allowed.iter().any(|entry| host_matches(host, entry)) {
+            Ok(())
+        } else {
+            Err(deny("host not on the allowlist"))
+        }
+    }
+}
+
+pub enum Body<'a> {
+    Empty,
+    Form(&'a [(&'a str, &'a str)]),
+    Json(&'a serde_json::Value),
+}
+
+/// Status and (size-capped) body. `Debug` deliberately hides the body: it may hold tokens.
+pub struct HttpResponse {
+    pub status: u16,
+    body: Vec<u8>,
+}
+
+impl std::fmt::Debug for HttpResponse {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "HttpResponse {{ status: {}, body: {} bytes }}",
+            self.status,
+            self.body.len()
+        )
+    }
+}
+
+impl HttpResponse {
+    pub fn is_success(&self) -> bool {
+        (200..300).contains(&self.status)
+    }
+
+    pub fn json<T: DeserializeOwned>(&self) -> Result<T> {
+        serde_json::from_slice(&self.body)
+            .map_err(|_| Error::Http("the server sent a response in an unexpected format".into()))
+    }
+}
+
+fn http_err(e: reqwest::Error) -> Error {
+    // Strip the URL: it could carry query parameters.
+    Error::Http(e.without_url().to_string())
+}
+
+fn install_crypto_provider() {
+    static ONCE: Once = Once::new();
+    ONCE.call_once(|| {
+        // Err means another provider is already installed, which is fine.
+        let _ = rustls::crypto::ring::default_provider().install_default();
+    });
+}
+
+#[derive(Debug, Clone)]
+pub struct HttpClient {
+    inner: reqwest::Client,
+    policy: HostPolicy,
+}
+
+impl HttpClient {
+    pub fn new(user_agent: &str, policy: HostPolicy) -> Result<Self> {
+        install_crypto_provider();
+        let mut builder = reqwest::Client::builder()
+            .user_agent(user_agent)
+            .https_only(!policy.loopback_http_enabled())
+            .redirect(reqwest::redirect::Policy::none())
+            .connect_timeout(Duration::from_secs(10))
+            .timeout(Duration::from_secs(30));
+        if policy.loopback_http_enabled() {
+            // A system proxy must never intercept calls to a local mock server.
+            builder = builder.no_proxy();
+        }
+        Ok(Self {
+            inner: builder.build().map_err(http_err)?,
+            policy,
+        })
+    }
+
+    pub async fn execute(
+        &self,
+        method: Method,
+        url: &str,
+        body: Body<'_>,
+        bearer: Option<&str>,
+    ) -> Result<HttpResponse> {
+        let url = Url::parse(url).map_err(|_| Error::HostNotAllowed("invalid URL".into()))?;
+        self.policy.check(&url)?;
+
+        let mut request = self.inner.request(method.clone(), url.clone());
+        request = match body {
+            Body::Empty => request,
+            Body::Form(fields) => request.form(fields),
+            Body::Json(value) => request.json(value),
+        };
+        if let Some(token) = bearer {
+            request = request.bearer_auth(token);
+        }
+
+        let mut response = request.send().await.map_err(http_err)?;
+        let status = response.status().as_u16();
+        tracing::debug!(
+            %method,
+            host = url.host_str().unwrap_or(""),
+            path = url.path(),
+            status,
+            "http response"
+        );
+
+        let mut body = Vec::new();
+        while let Some(chunk) = response.chunk().await.map_err(http_err)? {
+            if body.len() + chunk.len() > MAX_RESPONSE_BYTES {
+                return Err(Error::Http("the server's response was too large".into()));
+            }
+            body.extend_from_slice(&chunk);
+        }
+        Ok(HttpResponse { status, body })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use wiremock::matchers::{header, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    use super::*;
+
+    fn policy() -> HostPolicy {
+        HostPolicy::new(&["login.example.com", ".xboxlive.com"])
+    }
+
+    fn check(url: &str) -> Result<()> {
+        policy().check(&Url::parse(url).unwrap())
+    }
+
+    #[test]
+    fn allows_listed_hosts_and_subdomains_over_https() {
+        check("https://login.example.com/token").unwrap();
+        check("https://user.auth.xboxlive.com/x").unwrap();
+        check("https://xboxlive.com/").unwrap();
+        check("https://login.example.com:443/").unwrap();
+    }
+
+    #[test]
+    fn rejects_everything_else() {
+        for bad in [
+            "http://login.example.com/",
+            "https://other.example.com/",
+            "https://evilxboxlive.com/",
+            "https://user.auth.xboxlive.com.evil.net/",
+            "https://login.example.com:8443/",
+            "https://user:pass@login.example.com/",
+            "https://login.example.com@evil.net/",
+            "ftp://login.example.com/",
+            "http://127.0.0.1:1234/",
+            "https://127.0.0.1/",
+        ] {
+            assert!(check(bad).is_err(), "allowed {bad}");
+        }
+    }
+
+    fn client() -> HttpClient {
+        HttpClient::new("Kiln-test/0", HostPolicy::new(&[]).with_loopback_http()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn sends_form_and_bearer_and_reads_json() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/echo"))
+            .and(header("authorization", "Bearer tok-123"))
+            .and(header("user-agent", "Kiln-test/0"))
+            .and(wiremock::matchers::body_string("a=1&b=two+words"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"ok": true})))
+            .mount(&server)
+            .await;
+
+        let url = format!("{}/echo", server.uri());
+        let resp = client()
+            .execute(
+                Method::POST,
+                &url,
+                Body::Form(&[("a", "1"), ("b", "two words")]),
+                Some("tok-123"),
+            )
+            .await
+            .unwrap();
+        assert!(resp.is_success());
+        assert_eq!(resp.json::<serde_json::Value>().unwrap()["ok"], true);
+        assert!(
+            !format!("{resp:?}").contains("ok"),
+            "Debug must not show the body"
+        );
+    }
+
+    #[tokio::test]
+    async fn does_not_follow_redirects() {
+        let server = MockServer::start().await;
+        Mock::given(path("/r"))
+            .respond_with(
+                ResponseTemplate::new(302).insert_header("location", "https://evil.example/"),
+            )
+            .mount(&server)
+            .await;
+        let resp = client()
+            .execute(
+                Method::GET,
+                &format!("{}/r", server.uri()),
+                Body::Empty,
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status, 302);
+    }
+
+    #[tokio::test]
+    async fn rejects_oversized_responses() {
+        let server = MockServer::start().await;
+        Mock::given(path("/big"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_bytes(vec![b'x'; MAX_RESPONSE_BYTES + 1]),
+            )
+            .mount(&server)
+            .await;
+        let err = client()
+            .execute(
+                Method::GET,
+                &format!("{}/big", server.uri()),
+                Body::Empty,
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::Http(_)), "{err:?}");
+    }
+
+    #[tokio::test]
+    async fn policy_is_enforced_before_any_connection() {
+        let strict = HttpClient::new("Kiln-test/0", policy()).unwrap();
+        let err = strict
+            .execute(Method::GET, "http://login.example.com/", Body::Empty, None)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::HostNotAllowed(_)));
+    }
+}
+
+<<<<<KILN-END>>>>>

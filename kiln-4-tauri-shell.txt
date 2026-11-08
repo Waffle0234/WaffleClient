@@ -1,0 +1,364 @@
+Kiln source bundle 4 of 6: Tauri shell: state, IPC commands, capabilities, tauri.conf.json (CSP).
+Rebuild the repository by running `python3 restore.py` next to these files. Text before the first marker is ignored.
+
+<<<<<KILN-FILE src-tauri/Cargo.toml>>>>>
+[package]
+name = "kiln"
+description = "Kiln launcher: Tauri shell. Validates input and calls kiln-core."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[lib]
+name = "kiln_lib"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+kiln-core = { path = "../crates/kiln-core" }
+serde.workspace = true
+serde_json.workspace = true
+opener = { version = "0.9", default-features = false }
+tauri = { version = "2", features = [] }
+tracing.workspace = true
+
+<<<<<KILN-END>>>>>
+<<<<<KILN-FILE src-tauri/build.rs>>>>>
+//! Declares every IPC command in the app manifest. With a manifest, a command is only
+//! callable if a capability grants its `allow-*` permission (least privilege).
+
+pub const COMMANDS: &[&str] = &[
+    "get_app_info",
+    "get_settings",
+    "set_setting",
+    "auth_begin_device_flow",
+    "auth_poll",
+    "auth_cancel",
+    "auth_open_verification_page",
+    "auth_list_accounts",
+    "auth_set_active",
+    "auth_remove",
+];
+
+fn main() {
+    let manifest = tauri_build::AppManifest::new().commands(COMMANDS);
+    let attributes = tauri_build::Attributes::new().app_manifest(manifest);
+    if let Err(e) = tauri_build::try_build(attributes) {
+        eprintln!("tauri-build failed: {e:#}");
+        std::process::exit(1);
+    }
+}
+
+<<<<<KILN-END>>>>>
+<<<<<KILN-FILE src-tauri/capabilities/default.json>>>>>
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "Minimal permissions for the main window: only Kiln's own commands.",
+  "windows": [
+    "main"
+  ],
+  "permissions": [
+    "allow-get-app-info",
+    "allow-get-settings",
+    "allow-set-setting",
+    "allow-auth-begin-device-flow",
+    "allow-auth-poll",
+    "allow-auth-cancel",
+    "allow-auth-open-verification-page",
+    "allow-auth-list-accounts",
+    "allow-auth-set-active",
+    "allow-auth-remove"
+  ]
+}
+
+<<<<<KILN-END>>>>>
+<<<<<KILN-FILE src-tauri/src/commands/app.rs>>>>>
+use kiln_core::settings::Settings;
+use kiln_core::AppError;
+use serde::Serialize;
+use tauri::State;
+
+use crate::state::AppState;
+
+#[derive(Debug, Serialize)]
+pub struct AppInfo {
+    pub name: &'static str,
+    pub version: &'static str,
+    pub os: &'static str,
+    pub arch: &'static str,
+    pub portable: bool,
+    pub data_dir: String,
+}
+
+#[tauri::command]
+pub fn get_app_info(state: State<'_, AppState>) -> AppInfo {
+    AppInfo {
+        name: kiln_core::APP_NAME,
+        version: kiln_core::APP_VERSION,
+        os: std::env::consts::OS,
+        arch: std::env::consts::ARCH,
+        portable: state.dirs.portable,
+        data_dir: state.dirs.root.display().to_string(),
+    }
+}
+
+#[tauri::command]
+pub async fn get_settings(state: State<'_, AppState>) -> Result<Settings, AppError> {
+    Ok(state.settings.load().await?)
+}
+
+#[tauri::command]
+pub async fn set_setting(
+    state: State<'_, AppState>,
+    key: String,
+    value: serde_json::Value,
+) -> Result<Settings, AppError> {
+    let updated = state.settings.set(&key, value).await?;
+    if key == "log_level" {
+        state.log.set_level(&updated.log_level)?;
+    }
+    Ok(updated)
+}
+
+<<<<<KILN-END>>>>>
+<<<<<KILN-FILE src-tauri/src/commands/auth.rs>>>>>
+//! Sign-in commands. None of these ever returns a token: the UI only sees accounts and the
+//! short code the user types on Microsoft's page.
+
+use kiln_core::auth::{is_valid_account_id, Account, AuthError, DeviceCodeInfo};
+use kiln_core::{AppError, Error};
+use tauri::State;
+
+use crate::state::AppState;
+
+fn check_id(id: &str) -> Result<(), AppError> {
+    if is_valid_account_id(id) {
+        Ok(())
+    } else {
+        Err(Error::from(AuthError::InvalidAccountId).into())
+    }
+}
+
+#[tauri::command]
+pub async fn auth_begin_device_flow(
+    state: State<'_, AppState>,
+) -> Result<DeviceCodeInfo, AppError> {
+    Ok(state.auth.begin_device_flow().await?)
+}
+
+/// Resolves when the user finishes (or abandons) the sign-in started by
+/// `auth_begin_device_flow`. Can take minutes; `auth_cancel` ends it early.
+#[tauri::command]
+pub async fn auth_poll(state: State<'_, AppState>) -> Result<Account, AppError> {
+    Ok(state.auth.poll().await?)
+}
+
+#[tauri::command]
+pub fn auth_cancel(state: State<'_, AppState>) {
+    state.auth.cancel_flow();
+}
+
+/// Opens the sign-in page in the default browser. Takes no arguments on purpose: the
+/// address comes from the validated pending flow, never from the webview.
+#[tauri::command]
+pub async fn auth_open_verification_page(state: State<'_, AppState>) -> Result<(), AppError> {
+    let uri = state
+        .auth
+        .pending_verification_uri()
+        .ok_or_else(|| Error::from(AuthError::NoPendingFlow))?;
+    tauri::async_runtime::spawn_blocking(move || opener::open(uri))
+        .await
+        .map_err(|e| Error::Io(std::io::Error::other(e)))?
+        .map_err(|e| Error::Io(std::io::Error::other(e.to_string())))?;
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn auth_list_accounts(state: State<'_, AppState>) -> Result<Vec<Account>, AppError> {
+    Ok(state.auth.list_accounts().await?)
+}
+
+#[tauri::command]
+pub async fn auth_set_active(state: State<'_, AppState>, id: String) -> Result<Account, AppError> {
+    check_id(&id)?;
+    Ok(state.auth.set_active(&id).await?)
+}
+
+#[tauri::command]
+pub async fn auth_remove(state: State<'_, AppState>, id: String) -> Result<(), AppError> {
+    check_id(&id)?;
+    Ok(state.auth.remove_account(&id).await?)
+}
+
+<<<<<KILN-END>>>>>
+<<<<<KILN-FILE src-tauri/src/commands/mod.rs>>>>>
+pub mod app;
+pub mod auth;
+
+<<<<<KILN-END>>>>>
+<<<<<KILN-FILE src-tauri/src/lib.rs>>>>>
+//! Tauri shell. Rule: this crate only validates input, calls `kiln-core`, and maps
+//! errors. Logic and tests live in `kiln-core`.
+
+mod commands;
+mod state;
+
+use std::path::PathBuf;
+
+use state::AppState;
+
+pub fn run() {
+    let result = tauri::Builder::default()
+        .setup(|app| {
+            use tauri::Manager;
+            let exe_dir: Option<PathBuf> = std::env::current_exe()
+                .ok()
+                .and_then(|exe| exe.parent().map(PathBuf::from));
+            let state = tauri::async_runtime::block_on(AppState::init(exe_dir.as_deref()))?;
+            app.manage(state);
+            Ok(())
+        })
+        .invoke_handler(tauri::generate_handler![
+            commands::app::get_app_info,
+            commands::app::get_settings,
+            commands::app::set_setting,
+            commands::auth::auth_begin_device_flow,
+            commands::auth::auth_poll,
+            commands::auth::auth_cancel,
+            commands::auth::auth_open_verification_page,
+            commands::auth::auth_list_accounts,
+            commands::auth::auth_set_active,
+            commands::auth::auth_remove,
+        ])
+        .run(tauri::generate_context!());
+
+    if let Err(e) = result {
+        tracing::error!(error = %e, "Kiln failed to start");
+        eprintln!("Kiln failed to start: {e}");
+        std::process::exit(1);
+    }
+}
+
+<<<<<KILN-END>>>>>
+<<<<<KILN-FILE src-tauri/src/main.rs>>>>>
+// Hide the console window on Windows release builds.
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
+fn main() {
+    kiln_lib::run();
+}
+
+<<<<<KILN-END>>>>>
+<<<<<KILN-FILE src-tauri/src/state.rs>>>>>
+use std::path::Path;
+use std::sync::Arc;
+
+use kiln_core::auth::{client_id_from_env, AuthService, KeyringStore};
+use kiln_core::db::{self, Db};
+use kiln_core::logging::{self, LogGuard};
+use kiln_core::paths::DataDirs;
+use kiln_core::settings::SettingsStore;
+
+/// Keychain service name. Entries show up under this name in Keychain Access, Credential
+/// Manager, and Seahorse/KWallet.
+const KEYCHAIN_SERVICE: &str = "app.kiln.launcher";
+
+pub struct AppState {
+    pub dirs: DataDirs,
+    #[allow(dead_code)] // Used by later phases; kept so the pool lives as long as the app.
+    pub db: Db,
+    pub settings: SettingsStore,
+    pub auth: AuthService,
+    pub log: LogGuard,
+}
+
+impl AppState {
+    pub async fn init(exe_dir: Option<&Path>) -> kiln_core::Result<Self> {
+        let dirs = DataDirs::resolve(exe_dir)?;
+        dirs.ensure_created()?;
+
+        // Logging first so database problems are recorded. The saved level is applied
+        // as soon as settings are loaded. No background work happens after this.
+        let log = logging::init(&dirs.logs, "info", cfg!(debug_assertions))?;
+        tracing::info!(
+            version = kiln_core::APP_VERSION,
+            portable = dirs.portable,
+            "starting"
+        );
+
+        let db = db::open(&dirs.db_file).await?;
+        let settings = SettingsStore::new(db.clone());
+        log.set_level(&settings.load().await?.log_level)?;
+
+        let client_id = client_id_from_env();
+        if client_id.is_none() {
+            tracing::warn!("no Microsoft client id configured: sign-in is disabled");
+        }
+        let auth = AuthService::new(
+            db.clone(),
+            Arc::new(KeyringStore::new(KEYCHAIN_SERVICE)),
+            client_id,
+        )?;
+        auth.init().await?;
+
+        Ok(Self {
+            dirs,
+            db,
+            settings,
+            auth,
+            log,
+        })
+    }
+}
+
+<<<<<KILN-END>>>>>
+<<<<<KILN-FILE src-tauri/tauri.conf.json>>>>>
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "Kiln",
+  "identifier": "app.kiln.launcher",
+  "build": {
+    "frontendDist": "../ui/dist",
+    "devUrl": "http://localhost:5173",
+    "beforeDevCommand": "npm --prefix ui run dev",
+    "beforeBuildCommand": "npm --prefix ui run build"
+  },
+  "app": {
+    "withGlobalTauri": false,
+    "windows": [
+      {
+        "label": "main",
+        "title": "Kiln",
+        "width": 1120,
+        "height": 720,
+        "minWidth": 860,
+        "minHeight": 560
+      }
+    ],
+    "security": {
+      "csp": "default-src 'self'; script-src 'self'; style-src 'self'; font-src 'self'; img-src 'self' data: https://cdn.modrinth.com https://textures.minecraft.net; connect-src ipc: http://ipc.localhost; object-src 'none'; base-uri 'none'; form-action 'none'"
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": "all",
+    "category": "Game",
+    "shortDescription": "A fast, secure Minecraft Java Edition launcher",
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ]
+  }
+}
+
+<<<<<KILN-END>>>>>

@@ -1,0 +1,620 @@
+Kiln source bundle 1 of 6: repository root: workspace config, README, docs, CI, tools.
+Rebuild the repository by running `python3 restore.py` next to these files. Text before the first marker is ignored.
+
+<<<<<KILN-FILE .github/dependabot.yml>>>>>
+version: 2
+updates:
+  - package-ecosystem: cargo
+    directory: /
+    schedule: { interval: weekly }
+  - package-ecosystem: npm
+    directory: /ui
+    schedule: { interval: weekly }
+  - package-ecosystem: github-actions
+    directory: /
+    schedule: { interval: weekly }
+
+<<<<<KILN-END>>>>>
+<<<<<KILN-FILE .github/workflows/ci.yml>>>>>
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    - cron: "17 4 * * 1" # weekly, so new advisories surface without a code change
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: "-D warnings"
+
+jobs:
+  core:
+    name: Rust (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - name: Install Linux WebView and keychain libraries
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev \
+            librsvg2-dev libsoup-3.0-dev libjavascriptcoregtk-4.1-dev libdbus-1-dev libssl-dev pkg-config
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: ui/package-lock.json
+      - name: Build the UI (the Tauri crate embeds ui/dist)
+        run: npm ci && npm run build
+        working-directory: ui
+      - run: cargo fmt --all --check
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo test --workspace
+
+  ui:
+    name: UI checks
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ui
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: ui/package-lock.json
+      - run: npm ci
+      - run: npm run check
+      - run: npm test
+      - run: npm run build
+
+  audit:
+    name: Dependency audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: npm audit
+        run: npm ci && npm audit --audit-level=high
+        working-directory: ui
+      - name: cargo audit
+        run: cargo install cargo-audit --locked && cargo audit
+
+<<<<<KILN-END>>>>>
+<<<<<KILN-FILE .gitignore>>>>>
+/target
+node_modules
+ui/dist
+src-tauri/gen
+*.log
+.DS_Store
+
+<<<<<KILN-END>>>>>
+<<<<<KILN-FILE Cargo.toml>>>>>
+[workspace]
+resolver = "2"
+members = ["crates/kiln-core", "src-tauri"]
+# `cargo test` at the repo root only builds the pure-Rust core, so it works
+# without the system WebView libraries. CI builds the whole workspace.
+default-members = ["crates/kiln-core"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+license = "GPL-3.0-only"
+publish = false
+
+[workspace.dependencies]
+dirs = "6"
+hex = "0.4"
+regex = "1"
+reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider", "http2", "json", "form", "system-proxy"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha1 = "0.10"
+sha2 = "0.10"
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "sqlite", "migrate", "macros"] }
+tempfile = "3"
+wiremock = "0.6"
+zeroize = { version = "1", features = ["derive"] }
+thiserror = "2"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs", "io-util", "time", "sync"] }
+tracing = "0.1"
+tracing-appender = "0.2"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "registry", "std"] }
+
+[workspace.lints.rust]
+unsafe_code = "deny"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+unwrap_used = "deny"
+expect_used = "deny"
+todo = "deny"
+unimplemented = "deny"
+dbg_macro = "deny"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true
+
+<<<<<KILN-END>>>>>
+<<<<<KILN-FILE README.md>>>>>
+# Kiln
+
+A fast, secure, cross-platform Minecraft Java Edition launcher (Windows, macOS, Linux).
+"Kiln" is a working codename: the display name lives in `kiln_core::APP_NAME` and
+`src-tauri/tauri.conf.json`.
+
+> Kiln is not affiliated with Mojang or Microsoft. Minecraft is a trademark of Mojang AB.
+> A legitimately owned Minecraft account is required for online play.
+
+**Status:** Phase 2 of 8 done (scaffold, settings, SQLite, logging, CI, Microsoft sign-in with OS keychain). Real sign-in needs an approved client ID: see [docs/AUTH.md](docs/AUTH.md). See
+[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the roadmap.
+
+## Layout
+
+| Path | Purpose |
+|---|---|
+| `crates/kiln-core` | All launcher logic. No GUI dependency, fully unit-tested. |
+| `src-tauri` | Tauri 2 shell: validates IPC input, calls core, maps errors. |
+| `ui` | Svelte 5 + TypeScript + Tailwind 4 frontend. |
+
+## Build and test
+
+Requirements: Rust 1.85+, Node 22+. On Linux, Tauri's system libraries
+(`libwebkit2gtk-4.1-dev`, `libgtk-3-dev`, `libayatana-appindicator3-dev`, `librsvg2-dev`,
+`libsoup-3.0-dev`) plus `libdbus-1-dev` for the keychain.
+
+```sh
+# Core logic only (no WebView libraries needed)
+cargo test
+
+# Whole workspace, as CI runs it
+(cd ui && npm ci && npm run build)
+cargo fmt --all --check
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace
+
+# UI checks
+(cd ui && npm run check && npm test)
+
+# Run the desktop app
+cargo install tauri-cli --version "^2" --locked
+cargo tauri dev
+```
+
+`npm run dev` inside `ui/` also works in a plain browser using an in-memory stand-in for
+the backend, which is handy for styling work. Set `KILN_LOG=debug` (any `tracing` filter)
+to override the log level.
+
+## Data and portable mode
+
+Data lives in the platform data directory under `Kiln`. Create a file or folder named
+`kiln-portable` next to the executable to keep everything in `kiln-data/` beside the app.
+
+## Security model (summary)
+
+Full document arrives in Phase 8. What already holds:
+
+- Only the `allow-*` permissions in `src-tauri/capabilities` are granted to the webview;
+  there are no `fs`, `shell` or `http` plugins.
+- Strict CSP: no inline or remote scripts, no `eval`, fonts and styles from the app only.
+- Every log line passes through a redactor that masks tokens, launch credentials,
+  e-mail addresses and OS account names before it is written.
+- `SafePath` is the only way to turn untrusted relative paths into file operations: it
+  rejects `..`, absolute paths, Windows device names and symlink escapes.
+- Sign-in tokens: refresh tokens exist only in the OS keychain, access tokens only in memory, and
+  none ever reaches the webview or a log.
+- All network traffic goes through one client that is HTTPS-only, allowlisted by host and
+  never follows redirects.
+- Hashes are verified with SHA-1/256/512 before any downloaded file is kept.
+- No telemetry.
+
+## Licensing
+
+Kiln is released under **GPL-3.0-only** (see `LICENSE`). Bundled or auto-installed mods
+keep their own licenses; Kiln only downloads them from their official source and never
+redistributes them itself.
+
+<<<<<KILN-END>>>>>
+<<<<<KILN-FILE clippy.toml>>>>>
+allow-unwrap-in-tests = true
+allow-expect-in-tests = true
+
+<<<<<KILN-END>>>>>
+<<<<<KILN-FILE docs/ARCHITECTURE.md>>>>>
+# Architecture
+
+Approved design for Kiln. Boundary rule: `ui -> IPC -> src-tauri -> kiln-core`; all
+logic and tests live in `kiln-core`.
+
+## Modules in `kiln-core`
+
+Implemented: `paths` (data dirs, portable mode, `SafePath`), `hash`, `redact`, `logging`,
+`db` (SQLite, WAL, migrations), `settings`, `error`, `net` (allowlisted HTTPS client), `auth`
+(device-code sign-in, keychain, accounts).
+
+Planned: resumable downloader on top of `net`, `archive` (zip-slip-safe extraction), `mojang`, `java`, `loaders`, `instance`, `launch`,
+`mods` (`ModSource` trait, Modrinth, resolver, updater, rollback, mrpack), `perf`,
+`crash`, `backup`, `servers`.
+
+## Roadmap
+
+| Phase | Scope |
+|---|---|
+| 1 | Scaffold, settings, SQLite, logging, CI |
+| 2 (done) | Microsoft auth and OS keychain |
+| 3 | Version manifests, Java manager, downloader, vanilla launch |
+| 4 | Instances and loaders (Fabric and Quilt, then NeoForge and Forge) |
+| 5 | Modrinth browser, installs, dependencies, updates, rollback, modpacks |
+| 6 | Performance presets and benchmark |
+| 7 | UI polish, crash analyzer, backups |
+| 8 | Security audit, packaging, signed updater |
+
+## Data model
+
+Defined in `crates/kiln-core/migrations/0001_init.sql`. No secrets are stored in SQLite;
+refresh tokens go only to the OS keychain.
+
+## IPC commands
+
+Implemented: `get_app_info`, `get_settings`, `set_setting`, `auth_begin_device_flow`,
+`auth_poll` (waits until the user finishes; replaces repeated polling from the UI),
+`auth_cancel`, `auth_open_verification_page` (takes no argument: the address comes from the
+validated pending flow), `auth_list_accounts`, `auth_set_active`, `auth_remove`.
+Skin and cape URLs are part of `Account`, so there is no separate `auth_get_skin`. Every command must be listed
+in `src-tauri/build.rs` and granted in `src-tauri/capabilities/default.json`.
+Errors cross the boundary as `{ code, message }` with a plain-English message.
+
+<<<<<KILN-END>>>>>
+<<<<<KILN-FILE docs/AUTH.md>>>>>
+# Microsoft sign-in
+
+## How it works
+
+Kiln uses Microsoft's **device-code flow**: the app shows a short code, the user enters it
+on microsoft.com in any browser, and Kiln polls until they finish. There is no embedded
+webview, no local redirect server, and Kiln never sees the user's password.
+
+```
+Microsoft device code -> MS access + refresh token
+  -> Xbox Live user token -> XSTS token (relying party rp://api.minecraftservices.com/)
+  -> Minecraft access token -> Minecraft profile (404 means the account doesn't own the game)
+```
+
+Where things live:
+
+| Item | Storage |
+|---|---|
+| Refresh token | OS keychain only (Credential Manager / Keychain / Secret Service), stored as raw bytes |
+| Minecraft access token | Memory only, wiped on drop, refreshed ~5 minutes before expiry |
+| Device code | Memory only, never sent to the UI |
+| Account name, skin hash, flags | SQLite (`accounts` table), no secrets |
+
+No token ever crosses the IPC boundary. The UI receives `Account` and `DeviceCodeInfo`; only the
+launch pipeline can ask the backend for a `LaunchSession`.
+
+## Setup you must do before real sign-in works
+
+1. **Azure app registration** (portal.azure.com, App registrations, New registration).
+   - Supported account types: personal Microsoft accounts (consumer accounts).
+   - Name: must not contain "Mojang", "Minecraft" or similar protected words.
+   - Redirect URI: leave empty (device flow doesn't use one).
+   - Authentication, Advanced settings: **Allow public client flows = Yes**. Without this Microsoft
+     returns `AADSTS70002`.
+   - No client secret. Copy the **Application (client) ID**, a GUID.
+2. **Ask Mojang to approve the client ID** at <https://aka.ms/mce-reviewappid>. Until then
+   `login_with_xbox` answers 403 "Invalid app registration" and Kiln shows
+   "Mojang hasn't approved this build's Microsoft app registration". Reviews have been reported as
+   weekly; the form is authoritative, not this document.
+3. **Give the ID to Kiln**, either:
+   - at runtime: `KILN_MS_CLIENT_ID=<guid> cargo tauri dev` (handy while testing), or
+   - at build time: set `KILN_MS_CLIENT_ID` in the environment when building releases (it is read
+     with `option_env!`). A client ID is public information, not a secret.
+
+Anything that isn't a well-formed GUID is treated as "not configured".
+
+These steps were checked against third-party documentation and a Microsoft Q&A thread, not
+Mojang's own pages. Verify against the form before relying on them.
+
+## Errors users can see
+
+| Situation | Message gist |
+|---|---|
+| No client ID in this build | Sign-in isn't set up in this build |
+| Code not used in time | The code expired, start again |
+| Declined on Microsoft's page | Sign-in was cancelled |
+| XSTS `2148916233` | No Xbox profile yet; sign in at xbox.com once |
+| XSTS `2148916235` | Xbox unavailable in the account's region |
+| XSTS `2148916236` / `2148916237` | Adult verification needed |
+| XSTS `2148916238` | Child account; an adult must add it to a family group |
+| Profile 404 | Account doesn't own Minecraft: Java Edition |
+| Refresh rejected, or keychain entry missing | Sign in again (account stays listed, flagged) |
+| Keychain unavailable | Explains how to unlock it; nothing is stored in plaintext as a fallback |
+
+## Platform notes
+
+- **Linux** needs a running Secret Service provider (GNOME Keyring or KWallet), unlocked.
+- **Windows** Credential Manager limits a blob to 2,560 bytes. Tokens are stored as raw UTF-8 bytes
+  (the string API would store UTF-16 and double the size). A real refresh token is ~1.5 KB.
+
+## Testing
+
+Everything except the real OS keychain is covered by unit tests against a mock server
+(`cargo test`). The keychain test is ignored by default because most CI machines have no unlocked
+keychain: run `cargo test -p kiln-core -- --ignored keyring` on a machine that has one.
+It has been run on Linux with GNOME Keyring; macOS and Windows are untested.
+
+<<<<<KILN-END>>>>>
+<<<<<KILN-FILE docs/NEXT_STEPS.md>>>>>
+# Kiln: handoff prompt for the next chat
+
+Paste everything below the line into a new chat. Give the assistant the project in **one** of two ways:
+
+- **Bundle files** (for chat uploads with a file-count limit): attach `restore.py` and every
+  `kiln-*.txt` file, then the assistant runs `python3 restore.py` to rebuild the repository.
+  `kiln-6-lockfiles.txt` is optional and large (about 217 KB): skip it if context is tight.
+- **Local folder** (Claude Code on your own machine): unzip `kiln-phase2.zip` yourself, `cd` into
+  the folder and start Claude Code there. No attachments needed.
+
+---
+
+You are continuing a project already in progress: **Kiln** (a codename; the display name lives in
+`kiln_core::APP_NAME` and `src-tauri/tauri.conf.json`), a fast, secure, cross-platform (Windows,
+macOS, Linux) **Minecraft Java Edition launcher**. Stack: Tauri 2 (Rust backend), Svelte 5 +
+TypeScript + Tailwind 4 frontend, SQLite via sqlx, tokio, reqwest (rustls + ring), tracing.
+Licence: GPL-3.0-only.
+
+The project is provided either as bundle files (see "Your first steps") or as a folder already on
+disk. It has 3 commits when delivered as a folder (Phase 1, Phase 2, handoff); a restore from
+bundles starts a fresh history with one baseline commit. Read `README.md`, `docs/ARCHITECTURE.md`
+and `docs/AUTH.md` before writing anything. The architecture was
+**already approved by the user**: do not re-ask for approval, and do not redo finished work.
+
+## Status
+
+| Phase | Scope | State |
+|---|---|---|
+| 1 | Scaffold, settings, SQLite, logging, CI | Done |
+| 2 | Microsoft sign-in (device code), OS keychain, Accounts screen | Done, but real sign-in untested (see "User-side blockers") |
+| 3 | Version manifests, Java manager, downloader, vanilla launch | **To do** |
+| 4 | Instances and loaders (Fabric and Quilt, then NeoForge and Forge) | **To do** |
+| 5 | Modrinth browser, installs, dependency resolution, updates, rollback, modpacks | **To do** |
+| 6 | Performance presets, JVM flags, options optimizer, benchmark, in-game extras | **To do** |
+| 7 | UI polish, crash analyzer, world backups, servers, playtime | **To do** |
+| 8 | Security audit, packaging, signed auto-updater, final docs | **To do** |
+
+## What is still to build (from the original brief)
+
+**Phase 3**
+- Version manifests: parse Mojang's version manifest and per-version JSON including `rules`
+  (OS/arch/features), libraries, natives, assets index, and argument templates.
+- Downloader on top of `net::HttpClient`: parallel, resumable (Range), retry with jittered backoff,
+  SHA-1/SHA-256 verification before an atomic `.part` rename, progress via a `watch` channel, and a
+  shared content-addressed cache under `cache/{libraries,assets,jars}` hard-linked (copy fallback)
+  into instances. Respect the `max_concurrent_downloads` setting.
+- `archive.rs`: zip/tar extraction with zip-slip protection (use `paths::validate_relative`/`SafePath`).
+- Java manager: detect installed JDKs, auto-download the right Temurin (or Zulu) per Minecraft
+  version (8, 17, 21+) into `java/`, verify SHA-256, record in the `java_runtimes` table.
+- Launch pipeline: classpath, natives extraction, JVM and game arguments from the manifest, launch
+  with `AuthService::session_for_launch` (never log or expose the token), stream stdout/stderr
+  live to the UI (`game-log`, `game-exited` events), `launch_start/stop/status`, console screen.
+- Tests: manifest and rules parsing, downloader resume and hash-mismatch, and an integration test of
+  the launch pipeline against a mock server (wiremock is already a dev-dependency).
+- Extend the host allowlist for Mojang, Adoptium and Azul hosts (per-client `HostPolicy`).
+
+**Phase 4**: instances (create, clone, rename, delete, export, import in `.mrpack` and a native
+format) with isolated game version, loader, mods, resource packs, shaders, saves, options and
+Java/JVM settings; loaders Fabric, Quilt, NeoForge, Forge (run official installer processors
+headlessly with the managed JDK and hash-check everything); a version picker that hides
+incompatible combinations. The `instances` table already exists (`dir` is relative to `instances/`).
+
+**Phase 5**: a `ModSource` trait (so CurseForge can be added later) with a Modrinth v2
+implementation: proper User-Agent identifying app and version (Modrinth wants contact info), search
+with filters, project pages, version lists, dependency resolution (required, optional,
+incompatible), one-click install, update scan by file hash (`version_files`), changelogs, update-all,
+per-mod pinning, automatic rollback if the game fails to start after an update (previous jars kept
+in a backup folder, `mod_backups` table), full `.mrpack` install, update and export, rate-limit
+awareness, ETag caching (`http_cache` table), and "unverified" flagging of jars not from Modrinth
+(show author, downloads, licence). Never run anything from a modpack except installing its files.
+
+**Phase 6**: optional "Performance" preset that installs the loader-compatible set (Sodium, Lithium,
+FerriteCore, ModernFix, EntityCulling, ImmediatelyFast, Iris, Sodium extras) resolved per Minecraft
+version; JVM argument presets (Aikar-style or Generational ZGC/G1) by Java version and RAM with
+automatic RAM sizing and an advanced override; an "optimize" tool that writes recommended
+`options.txt` values; opt-in per-instance extras (HUD editor, zoom, freelook, screenshot manager,
+replay recorder) by integrating existing open-source mods via Modrinth and respecting licences;
+keybind and options profiles that can be saved, shared and applied (`option_profiles` table).
+
+**Phase 7**: finish the screens (Home with news and last-played, Instances grid, Instance detail with
+mods/packs/shaders/worlds/logs/settings, Mod browser, Console), a crash analyzer parsing
+`latest.log` and crash reports to suggest the likely culprit mod and a fix, scheduled world backups
+with one-click restore, server list with favorites/ping/quick-join, playtime stats, and a
+plugin/extension API for custom panels. Currently Home, Instances, Mods and Console are
+placeholders in `ui/src/components/Placeholder.svelte`.
+
+**Phase 8**: security audit pass; `cargo audit` in CI (never run locally yet); packaging (MSI/NSIS,
+DMG, AppImage/deb); Tauri updater with signature verification (not configured yet, no pubkey);
+`docs/SECURITY.md` and `docs/LICENSING.md`; the README security-model section completed; a properly
+designed app icon (the current one is an acceptable placeholder with a small notch); measure
+**release-build** idle RAM (a debug build under Xvfb showed roughly 144 MB for the app plus 190 MB
+for WebKit processes: a baseline, not a result).
+
+## Rules the codebase already follows (keep them)
+
+- All logic and tests live in `crates/kiln-core`; `src-tauri` only validates input, calls core and
+  maps errors. Strict clippy: `unwrap_used`/`expect_used` are denied outside tests.
+- Untrusted relative paths go through `paths::SafePath`/`validate_relative`. Never build file
+  paths from archive entries, modpack manifests or IPC strings any other way.
+- All network traffic goes through `net::HttpClient`: HTTPS only, per-client host allowlist, no
+  redirect following, 2 MiB response cap, never logs URLs beyond host and path or any body.
+  Redirect-following for downloads must re-check every hop against the allowlist.
+- Secrets: refresh tokens only in the OS keychain; access tokens in `SecretString` (hidden from
+  `Debug`, zeroized, auto-registered with the log redactor); no token crosses IPC or reaches a log.
+  Never add a plaintext fallback.
+- Every IPC command must be listed in `src-tauri/build.rs` `COMMANDS` **and** granted in
+  `src-tauri/capabilities/default.json` (`allow-<kebab-name>`), and return `Result<T, AppError>`
+  with a plain-English message. Validate inputs in the command (see `commands/auth.rs`).
+- Strict CSP in `tauri.conf.json` (no inline scripts/styles, fonts self-hosted, `img-src` allows
+  only Modrinth CDN and `textures.minecraft.net`). Avoid Svelte transitions (they inject `<style>`);
+  use CSS transitions.
+- Legal: no cracked/offline-auth features, no Minecraft logos or assets, state non-affiliation
+  with Mojang/Microsoft, respect mod licences.
+- No telemetry. No background polling when idle.
+- Design language: "glaze" palette (celadon accent on slate-green dark; green-grey paper light),
+  Bricolage Grotesque headings and Public Sans body, ruled rows instead of card grids, user-themeable
+  accent. Follow the existing tokens in `ui/src/app.css`.
+
+## How I (the previous assistant) worked: please do the same
+
+- Work phase by phase. A phase is done only when `cargo fmt --all --check`,
+  `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace`,
+  `svelte-check`, `vitest`, and `npm audit --audit-level=high` pass. Commit once per phase.
+- **Mutation-check security claims.** After tests pass, deliberately break the behaviour (log a
+  token, drop an allowlist, reorder a write) and confirm a test fails. Verify the mutation actually
+  applied. This caught a real gap in Phase 1 (an untested `..` rule) and a silently failed mutation
+  in Phase 2.
+- For anything UI-visible, run the real binary under Xvfb and look at a screenshot (see
+  "Environment notes"). Svelte-check passing is not proof the CSP lets the page render.
+- Finish each phase with a short, honest summary: what was verified, what was not, deviations.
+- Ask clarifying questions only if truly blocking; otherwise decide, state the assumption, continue.
+
+## Environment notes (the sandbox the project was built in; adapt if yours differs)
+
+- No `rustup` access. Rust came from Ubuntu packages: `apt-get install rustc-1.91 cargo-1.91
+  rust-1.91-clippy rustfmt-1.91`, then `export PATH=/usr/lib/rust-1.91/bin:$PATH` (this directory has
+  `cargo`, `cargo-clippy`, `cargo-fmt`). Also needed: `build-essential pkg-config libssl-dev
+  libdbus-1-dev libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev librsvg2-dev
+  libsoup-3.0-dev libjavascriptcoregtk-4.1-dev`. For UI screenshots: `xvfb scrot xdotool dbus-x11`.
+  For a real-keychain test: `gnome-keyring libsecret-tools`.
+- One CPU core: a cold workspace build takes ~6 minutes. Run long builds detached:
+  `setsid nohup cargo ... > /tmp/x.log 2>&1 < /dev/null &` and poll the log. Plain `&` jobs die when
+  the tool call ends, and the VM was once restored from a snapshot mid-session (processes lost, disk
+  kept), so start a GUI, click and screenshot within a single call.
+- `/bin/sh` is dash: **no `{a,b}` brace expansion** in `mkdir -p`. Use explicit paths or `bash -c`.
+- Run the built app: `cargo build -p kiln --features tauri/custom-protocol` (embeds `ui/dist`, so run
+  `npm run build` in `ui/` first), then under `Xvfb :99` with `WEBKIT_DISABLE_COMPOSITING_MODE=1
+  WEBKIT_DISABLE_DMABUF_RENDERER=1 LIBGL_ALWAYS_SOFTWARE=1` and a throwaway `HOME`/`XDG_DATA_HOME`;
+  drive it with `xdotool`, capture with `scrot`.
+- Real-keychain test: inside `dbus-run-session`, start `gnome-keyring-daemon --unlock
+  --components=secrets`, then `cargo test -p kiln-core --lib -- --ignored keyring`.
+- Network egress from the sandbox is allowlisted (crates.io, npm, GitHub, Ubuntu mirrors), so real
+  Mojang/Microsoft/Modrinth calls cannot be made; use wiremock.
+- Newer dependency majors than you may expect resolved fine (Vite 8, TypeScript 6, vitest 5,
+  reqwest 0.13, keyring 3.6). Lockfiles are committed.
+
+## Not verified yet (treat as open risks)
+
+- The Windows and macOS builds and the GitHub Actions workflow have **never run**.
+- macOS Keychain and Windows Credential Manager paths are untested (Linux Secret Service passed).
+- `cargo audit` never run; `cargo tauri dev` and the `beforeDevCommand` (`npm --prefix ui run dev`)
+  never run.
+- Real Microsoft/Xbox/Minecraft calls have never been made (mock server only).
+
+## User-side blockers (the user said they will handle these themselves)
+
+Real sign-in needs a Microsoft Azure app registration (public client, personal accounts, "Allow
+public client flows" on) **and** Mojang's approval of that client ID via https://aka.ms/mce-reviewappid.
+Until then Mojang answers 403 "Invalid app registration" and Kiln shows a clear message. Details in
+`docs/AUTH.md`; those steps were checked against third-party sources only, so remind the user to
+verify them against Mojang's form. The client ID is supplied by `KILN_MS_CLIENT_ID` (runtime, or at
+build time).
+
+## Your first steps
+
+1. **If you received bundle files**: run `python3 restore.py` next to them (it writes `./kiln`,
+   rejects any path that would escape that folder, fetches the GPL-3.0 `LICENSE` text if the
+   network allows, and makes a baseline git commit). Then, because binary files can't travel in
+   text bundles, regenerate the icons (the Rust build of `src-tauri` fails without them):
+   `cd kiln/ui && npm ci && cd .. && pip install pillow && python3 tools/regen_icons.py`.
+   Tauri's `src-tauri/permissions/autogenerated/*.toml` also regenerate on the first build; if
+   `kiln-6-lockfiles.txt` was skipped, `Cargo.lock` and `ui/package-lock.json` are recreated by the
+   first `cargo build` / `npm install` (commit them, and run the baseline to confirm nothing broke).
+2. Install the toolchain if needed and run the baseline: `cargo test -p kiln-core` should report 76
+   passed, 1 ignored, plus 1 logging integration test; then
+   `cd ui && npm ci && npx svelte-check && npx vitest run`.
+3. Start **Phase 3** immediately. Plan the module layout in a few lines (no new approval round),
+   build it, and report as described above.
+
+<<<<<KILN-END>>>>>
+<<<<<KILN-FILE tools/regen_icons.py>>>>>
+#!/usr/bin/env python3
+"""Regenerate Kiln's app icons (original artwork, no Minecraft imagery).
+
+Draws a 1024px kiln-mouth glyph with Pillow, then runs `tauri icon` (installed as a dev
+dependency in ui/) to produce every size, and deletes the unused mobile icon sets.
+
+    pip install pillow          # if missing
+    (cd ui && npm ci)           # installs the Tauri CLI
+    python3 tools/regen_icons.py [--out DIR]
+
+`--out` defaults to src-tauri/icons. The Rust build of src-tauri needs these files to exist.
+"""
+import pathlib
+import shutil
+import subprocess
+import sys
+
+from PIL import Image, ImageDraw
+
+ROOT = pathlib.Path(__file__).resolve().parent.parent
+
+
+def draw(path: pathlib.Path) -> None:
+    size = 1024
+    img = Image.new("RGBA", (size, size), (0, 0, 0, 0))
+    d = ImageDraw.Draw(img)
+    d.rounded_rectangle((64, 64, size - 64, size - 64), radius=220, fill=(24, 33, 31, 255))
+    d.rounded_rectangle((232, 300, 792, 800), radius=60, fill=(40, 54, 50, 255))
+    d.pieslice((232, 250, 792, 610), 180, 360, fill=(40, 54, 50, 255))
+    d.pieslice((372, 430, 652, 710), 180, 360, fill=(95, 185, 154, 255))
+    d.rectangle((372, 570, 652, 800), fill=(95, 185, 154, 255))
+    d.rectangle((372, 740, 652, 800), fill=(24, 33, 31, 255))
+    img.save(path)
+
+
+def main() -> int:
+    out = ROOT / "src-tauri" / "icons"
+    if "--out" in sys.argv:
+        out = pathlib.Path(sys.argv[sys.argv.index("--out") + 1]).resolve()
+    source = ROOT / "icon-source.png"
+    draw(source)
+    try:
+        subprocess.run(
+            ["npx", "tauri", "icon", str(source), "-o", str(out)],
+            cwd=ROOT / "ui",
+            check=True,
+            stdout=subprocess.DEVNULL,
+        )
+    finally:
+        source.unlink(missing_ok=True)
+    for mobile in ("android", "ios"):
+        shutil.rmtree(out / mobile, ignore_errors=True)
+    print(f"icons written to {out}: {len(list(out.iterdir()))} files")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+
+<<<<<KILN-END>>>>>
