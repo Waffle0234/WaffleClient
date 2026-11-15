@@ -1,0 +1,2897 @@
+Kiln source bundle 4 of 8: kiln-core downloads and game data: archives, downloader, Java manager, Mojang manifests/rules/libraries.
+Rebuild the repository by running `python3 restore.py` next to these files. Text before the first marker is ignored.
+
+<<<<<KILN-FILE crates/kiln-core/src/archive.rs>>>>>
+//! Archive extraction (zip and tar.gz) that treats every entry name as hostile.
+//!
+//! Each entry's destination is built with [`SafePath`], which rejects `..`, absolute paths,
+//! Windows device names and anything that resolves outside the target folder through a
+//! symlink. Hard links are refused; symlinks are only created when their target stays
+//! inside the folder. A total-size cap stops decompression bombs.
+
+use std::fs::File;
+use std::io::{self, Read};
+use std::path::Path;
+
+use crate::paths::{validate_relative, SafePath};
+use crate::{Error, Result};
+
+/// Default cap on the total unpacked size: more than any JDK or natives bundle we handle.
+pub const DEFAULT_MAX_UNPACKED: u64 = 2 * 1024 * 1024 * 1024;
+
+pub struct ExtractOptions<'a> {
+    /// Leading path components to drop from every entry (`1` removes a JDK's top folder).
+    pub strip_components: usize,
+    pub max_total_bytes: u64,
+    /// Return `false` to skip an entry. Receives the entry's original name.
+    pub filter: Option<&'a dyn Fn(&str) -> bool>,
+}
+
+impl Default for ExtractOptions<'_> {
+    fn default() -> Self {
+        Self {
+            strip_components: 0,
+            max_total_bytes: DEFAULT_MAX_UNPACKED,
+            filter: None,
+        }
+    }
+}
+
+fn bad(msg: impl Into<String>) -> Error {
+    Error::Archive(msg.into())
+}
+
+impl From<zip::result::ZipError> for Error {
+    fn from(e: zip::result::ZipError) -> Self {
+        Self::Archive(e.to_string())
+    }
+}
+
+/// Where an entry goes, or `None` if it is the stripped-away top folder itself.
+fn destination(root: &Path, name: &str, strip: usize) -> Result<Option<SafePath>> {
+    // Validate the whole original name first so a `..` hidden in a stripped component
+    // is still caught.
+    let parts = validate_relative(name)?;
+    if parts.len() <= strip {
+        return Ok(None);
+    }
+    Ok(Some(SafePath::new(root, &parts[strip..].join("/"))?))
+}
+
+#[cfg(unix)]
+fn set_mode(path: &Path, executable: bool) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let mode = if executable { 0o755 } else { 0o644 };
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn set_mode(_path: &Path, _executable: bool) -> Result<()> {
+    Ok(())
+}
+
+/// Copy at most the remaining budget from `reader`, failing if the entry is larger.
+fn copy_limited(reader: &mut impl Read, dest: &Path, total: &mut u64, max: u64) -> Result<()> {
+    let mut out = File::create(dest)?;
+    let remaining = max.saturating_sub(*total);
+    let copied = io::copy(&mut reader.take(remaining.saturating_add(1)), &mut out)?;
+    *total += copied;
+    if *total > max {
+        drop(out);
+        let _ = std::fs::remove_file(dest);
+        return Err(bad("the archive is larger than allowed"));
+    }
+    Ok(())
+}
+
+/// Read one named entry of a zip fully into memory, refusing entries over `max_bytes`.
+pub fn read_zip_entry(archive: &Path, name: &str, max_bytes: u64) -> Result<Vec<u8>> {
+    let mut zip = zip::ZipArchive::new(File::open(archive)?)?;
+    let entry = zip.by_name(name)?;
+    let mut out = Vec::new();
+    entry
+        .take(max_bytes.saturating_add(1))
+        .read_to_end(&mut out)?;
+    if out.len() as u64 > max_bytes {
+        return Err(bad("an entry in the archive is larger than allowed"));
+    }
+    Ok(out)
+}
+
+/// Extract a zip into `root` (created if needed). Returns the number of files written.
+pub fn extract_zip(archive: &Path, root: &Path, opts: &ExtractOptions<'_>) -> Result<usize> {
+    std::fs::create_dir_all(root)?;
+    let mut zip = zip::ZipArchive::new(File::open(archive)?)?;
+    let (mut files, mut total) = (0usize, 0u64);
+    for i in 0..zip.len() {
+        let mut entry = zip.by_index(i)?;
+        let name = entry.name().to_owned();
+        if opts.filter.is_some_and(|f| !f(&name)) {
+            continue;
+        }
+        let mode = entry.unix_mode();
+        if mode.is_some_and(|m| m & 0o170_000 == 0o120_000) {
+            return Err(bad("the archive contains a symbolic link"));
+        }
+        let Some(dest) = destination(root, &name, opts.strip_components)? else {
+            continue;
+        };
+        if entry.is_dir() {
+            std::fs::create_dir_all(dest.as_path())?;
+            continue;
+        }
+        if let Some(parent) = dest.as_path().parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        copy_limited(&mut entry, dest.as_path(), &mut total, opts.max_total_bytes)?;
+        set_mode(dest.as_path(), mode.is_some_and(|m| m & 0o111 != 0))?;
+        files += 1;
+    }
+    Ok(files)
+}
+
+/// Zip up `src_dir` into `dest`, naming entries `prefix` + relative path. Top-level names in
+/// `skip_top` are left out, symlinks are never followed, and `first` entries (name, bytes)
+/// are written before the folder contents. The archive appears at `dest` only when complete.
+pub fn write_zip(
+    dest: &Path,
+    prefix: &str,
+    src_dir: &Path,
+    skip_top: &[&str],
+    first: &[(String, Vec<u8>)],
+) -> Result<()> {
+    use zip::write::SimpleFileOptions;
+    fn walk(
+        w: &mut zip::ZipWriter<File>,
+        dir: &Path,
+        rel: &str,
+        top: bool,
+        prefix: &str,
+        skip: &[&str],
+    ) -> Result<()> {
+        let mut entries: Vec<_> = std::fs::read_dir(dir)?.collect::<std::io::Result<_>>()?;
+        entries.sort_by_key(std::fs::DirEntry::file_name);
+        for e in entries {
+            let name = e.file_name().to_string_lossy().into_owned();
+            if top && skip.contains(&name.as_str()) {
+                continue;
+            }
+            let rel_name = if rel.is_empty() {
+                name
+            } else {
+                format!("{rel}/{name}")
+            };
+            let kind = e.file_type()?;
+            if kind.is_dir() {
+                walk(w, &e.path(), &rel_name, false, prefix, skip)?;
+            } else if kind.is_file() {
+                let big = e.metadata()?.len() > 3 * 1024 * 1024 * 1024;
+                let opts = SimpleFileOptions::default()
+                    .compression_method(zip::CompressionMethod::Deflated)
+                    .large_file(big);
+                w.start_file(format!("{prefix}{rel_name}"), opts)?;
+                io::copy(&mut File::open(e.path())?, w)?;
+            }
+        }
+        Ok(())
+    }
+    let tmp = dest.with_extension("partial");
+    let result = (|| -> Result<()> {
+        let mut w = zip::ZipWriter::new(File::create(&tmp)?);
+        let opts =
+            SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
+        for (name, data) in first {
+            w.start_file(name.as_str(), opts)?;
+            io::Write::write_all(&mut w, data)?;
+        }
+        walk(&mut w, src_dir, "", true, prefix, skip_top)?;
+        w.finish()?;
+        Ok(())
+    })();
+    match result {
+        Ok(()) => Ok(std::fs::rename(&tmp, dest)?),
+        Err(e) => {
+            let _ = std::fs::remove_file(&tmp);
+            Err(e)
+        }
+    }
+}
+
+/// Lexically check that a symlink at `link_rel` pointing at `target` stays inside the root.
+fn symlink_stays_inside(link_rel: &[&str], target: &str) -> bool {
+    if target.is_empty()
+        || target.starts_with('/')
+        || target.starts_with('\\')
+        || target.contains(':')
+    {
+        return false;
+    }
+    let mut stack: Vec<&str> = link_rel[..link_rel.len().saturating_sub(1)].to_vec();
+    for part in target.split(['/', '\\']) {
+        match part {
+            "" | "." => {}
+            ".." => {
+                if stack.pop().is_none() {
+                    return false;
+                }
+            }
+            p => stack.push(p),
+        }
+    }
+    true
+}
+
+/// Extract a `.tar.gz` into `root` (created if needed). Returns the number of files written.
+pub fn extract_tar_gz(archive: &Path, root: &Path, opts: &ExtractOptions<'_>) -> Result<usize> {
+    std::fs::create_dir_all(root)?;
+    let gz = flate2::read::GzDecoder::new(File::open(archive)?);
+    let mut tar = tar::Archive::new(gz);
+    let (mut files, mut total) = (0usize, 0u64);
+    for entry in tar.entries()? {
+        let mut entry = entry?;
+        let name = entry.path()?.to_string_lossy().into_owned();
+        let kind = entry.header().entry_type();
+        if kind.is_hard_link() {
+            return Err(bad("the archive contains a hard link"));
+        }
+        if !(kind.is_file() || kind.is_dir() || kind.is_symlink()) {
+            continue; // pax headers, devices and the like carry no files we want
+        }
+        if opts.filter.is_some_and(|f| !f(&name)) {
+            continue;
+        }
+        let Some(dest) = destination(root, &name, opts.strip_components)? else {
+            continue;
+        };
+        if kind.is_dir() {
+            std::fs::create_dir_all(dest.as_path())?;
+            continue;
+        }
+        if let Some(parent) = dest.as_path().parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        if kind.is_symlink() {
+            let target = entry
+                .link_name()?
+                .map(|t| t.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            let rel = dest.relative().to_string_lossy().replace('\\', "/");
+            let rel_parts: Vec<&str> = rel.split('/').collect();
+            if !symlink_stays_inside(&rel_parts, &target) {
+                return Err(bad(
+                    "the archive contains a link that points outside its folder",
+                ));
+            }
+            #[cfg(unix)]
+            {
+                let _ = std::fs::remove_file(dest.as_path());
+                std::os::unix::fs::symlink(&target, dest.as_path())?;
+            }
+            continue;
+        }
+        let executable = entry.header().mode().is_ok_and(|m| m & 0o111 != 0);
+        copy_limited(&mut entry, dest.as_path(), &mut total, opts.max_total_bytes)?;
+        set_mode(dest.as_path(), executable)?;
+        files += 1;
+    }
+    Ok(files)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::Write;
+
+    use super::*;
+
+    fn make_zip(path: &Path, entries: &[(&str, &[u8])]) {
+        let mut w = zip::ZipWriter::new(File::create(path).unwrap());
+        let opts = zip::write::SimpleFileOptions::default();
+        for (name, data) in entries {
+            w.start_file(*name, opts).unwrap();
+            w.write_all(data).unwrap();
+        }
+        w.finish().unwrap();
+    }
+
+    fn make_tar_gz(
+        path: &Path,
+        build: impl FnOnce(&mut tar::Builder<flate2::write::GzEncoder<File>>),
+    ) {
+        let gz =
+            flate2::write::GzEncoder::new(File::create(path).unwrap(), flate2::Compression::fast());
+        let mut b = tar::Builder::new(gz);
+        build(&mut b);
+        b.into_inner().unwrap().finish().unwrap();
+    }
+
+    /// Append an entry with a raw, unvalidated name (the builder refuses `..` itself).
+    fn append_raw(b: &mut tar::Builder<flate2::write::GzEncoder<File>>, name: &str, data: &[u8]) {
+        let mut h = tar::Header::new_gnu();
+        h.as_gnu_mut().unwrap().name[..name.len()].copy_from_slice(name.as_bytes());
+        h.set_size(data.len() as u64);
+        h.set_mode(0o644);
+        h.set_entry_type(tar::EntryType::Regular);
+        h.set_cksum();
+        b.append(&h, data).unwrap();
+    }
+
+    fn dirs() -> (tempfile::TempDir, std::path::PathBuf, std::path::PathBuf) {
+        let base = tempfile::tempdir().unwrap();
+        let out = base.path().join("out");
+        let zip = base.path().join("a.archive");
+        (base, out, zip)
+    }
+
+    #[test]
+    fn zip_extracts_nested_files_and_strips_components() {
+        let (_b, out, z) = dirs();
+        make_zip(&z, &[("top/bin/java.exe", b"J"), ("top/readme.txt", b"R")]);
+        let n = extract_zip(
+            &z,
+            &out,
+            &ExtractOptions {
+                strip_components: 1,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(n, 2);
+        assert_eq!(std::fs::read(out.join("bin/java.exe")).unwrap(), b"J");
+        assert!(!out.join("top").exists());
+    }
+
+    #[test]
+    fn zip_slip_entries_are_rejected_and_nothing_escapes() {
+        for evil in [
+            "../evil.txt",
+            "a/../../evil.txt",
+            "..\\evil.txt",
+            "/abs/evil.txt",
+            "C:\\evil.txt",
+        ] {
+            let (b, out, z) = dirs();
+            make_zip(&z, &[(evil, b"pwned")]);
+            let err = extract_zip(&z, &out, &ExtractOptions::default()).unwrap_err();
+            assert!(matches!(err, Error::InvalidPath(_)), "{evil}: {err:?}");
+            assert!(!b.path().join("evil.txt").exists(), "{evil} escaped");
+            assert!(!out.join("evil.txt").exists());
+        }
+    }
+
+    #[test]
+    fn zip_dotdot_hidden_in_a_stripped_component_is_still_rejected() {
+        let (_b, out, z) = dirs();
+        make_zip(&z, &[("../x/file.txt", b"p")]);
+        let opts = ExtractOptions {
+            strip_components: 2,
+            ..Default::default()
+        };
+        assert!(extract_zip(&z, &out, &opts).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn zip_symlinks_are_refused() {
+        let (_b, out, z) = dirs();
+        let mut w = zip::ZipWriter::new(File::create(&z).unwrap());
+        w.add_symlink(
+            "link",
+            "/etc/passwd",
+            zip::write::SimpleFileOptions::default(),
+        )
+        .unwrap();
+        w.finish().unwrap();
+        assert!(extract_zip(&z, &out, &ExtractOptions::default()).is_err());
+    }
+
+    #[test]
+    fn filter_skips_entries() {
+        let (_b, out, z) = dirs();
+        make_zip(
+            &z,
+            &[
+                ("lib.so", b"1"),
+                ("META-INF/MANIFEST.MF", b"2"),
+                ("x.txt", b"3"),
+            ],
+        );
+        let only_so = |n: &str| n.ends_with(".so");
+        let opts = ExtractOptions {
+            filter: Some(&only_so),
+            ..Default::default()
+        };
+        assert_eq!(extract_zip(&z, &out, &opts).unwrap(), 1);
+        assert!(out.join("lib.so").exists() && !out.join("META-INF").exists());
+    }
+
+    #[test]
+    fn unpacked_size_is_capped() {
+        let (_b, out, z) = dirs();
+        make_zip(&z, &[("big.bin", &vec![0u8; 10_000])]);
+        let opts = ExtractOptions {
+            max_total_bytes: 1000,
+            ..Default::default()
+        };
+        assert!(matches!(
+            extract_zip(&z, &out, &opts),
+            Err(Error::Archive(_))
+        ));
+        assert!(
+            !out.join("big.bin").exists(),
+            "an over-limit file must not be left behind"
+        );
+    }
+
+    #[test]
+    fn tar_gz_extracts_with_strip_and_keeps_exec_bit() {
+        let (_b, out, t) = dirs();
+        make_tar_gz(&t, |b| {
+            let mut h = tar::Header::new_gnu();
+            h.set_size(2);
+            h.set_mode(0o755);
+            h.set_cksum();
+            b.append_data(&mut h, "jdk-17/bin/java", &b"ok"[..])
+                .unwrap();
+        });
+        let n = extract_tar_gz(
+            &t,
+            &out,
+            &ExtractOptions {
+                strip_components: 1,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(n, 1);
+        assert_eq!(std::fs::read(out.join("bin/java")).unwrap(), b"ok");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_ne!(
+                std::fs::metadata(out.join("bin/java"))
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o111,
+                0
+            );
+        }
+    }
+
+    #[test]
+    fn tar_slip_entries_are_rejected() {
+        for evil in ["../evil.txt", "a/../../evil.txt", "/tmp/evil.txt"] {
+            let (b, out, t) = dirs();
+            make_tar_gz(&t, |bld| append_raw(bld, evil, b"pwned"));
+            let err = extract_tar_gz(&t, &out, &ExtractOptions::default()).unwrap_err();
+            assert!(matches!(err, Error::InvalidPath(_)), "{evil}: {err:?}");
+            assert!(!b.path().join("evil.txt").exists());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn tar_links_inside_are_kept_and_links_outside_or_hard_links_are_refused() {
+        let link = |b: &mut tar::Builder<flate2::write::GzEncoder<File>>,
+                    name: &str,
+                    target: &str,
+                    kind| {
+            let mut h = tar::Header::new_gnu();
+            h.set_entry_type(kind);
+            h.set_size(0);
+            h.set_cksum();
+            b.append_link(&mut h, name, target).unwrap();
+        };
+
+        let (_b, out, t) = dirs();
+        make_tar_gz(&t, |b| {
+            let mut h = tar::Header::new_gnu();
+            h.set_size(1);
+            h.set_cksum();
+            b.append_data(&mut h, "top/real.txt", &b"x"[..]).unwrap();
+            link(b, "top/legal/alias", "../real.txt", tar::EntryType::Symlink);
+        });
+        extract_tar_gz(
+            &t,
+            &out,
+            &ExtractOptions {
+                strip_components: 1,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(std::fs::read(out.join("legal/alias")).unwrap(), b"x");
+
+        for (target, kind) in [
+            ("../../etc/passwd", tar::EntryType::Symlink),
+            ("/etc/passwd", tar::EntryType::Symlink),
+            ("real.txt", tar::EntryType::Link),
+        ] {
+            let (_b, out, t) = dirs();
+            make_tar_gz(&t, |b| link(b, "x/evil", target, kind));
+            assert!(
+                extract_tar_gz(&t, &out, &ExtractOptions::default()).is_err(),
+                "{target}"
+            );
+        }
+    }
+
+    #[test]
+    fn symlink_target_rules() {
+        assert!(symlink_stays_inside(&["a", "b", "l"], "../c"));
+        assert!(!symlink_stays_inside(&["a", "l"], "../../c"));
+        assert!(!symlink_stays_inside(&["l"], "/etc"));
+        assert!(!symlink_stays_inside(&["l"], "C:foo"));
+    }
+}
+
+<<<<<KILN-END>>>>>
+<<<<<KILN-FILE crates/kiln-core/src/download.rs>>>>>
+//! Parallel, resumable, verified downloads.
+//!
+//! Every file is written to `<dest>.part`, hashed while it is written, checked against its
+//! expected digest, and only then renamed over `<dest>`, so a file at its final path has
+//! always passed verification. Interrupted downloads resume with a `Range` request.
+//! Destinations are [`SafePath`]s: callers can't hand this module a raw path.
+
+use std::collections::HashSet;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::Arc;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+use serde::Serialize;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::sync::{watch, Semaphore};
+use tokio::task::JoinSet;
+
+use crate::hash::{ExpectedHash, StreamHasher};
+use crate::net::HttpClient;
+use crate::paths::SafePath;
+use crate::{Error, Result};
+
+/// One file to fetch.
+#[derive(Debug, Clone)]
+pub struct DownloadTask {
+    pub url: String,
+    pub dest: SafePath,
+    /// Verified before the file is kept. Strongly preferred.
+    pub hash: Option<ExpectedHash>,
+    /// Expected size in bytes. Used for progress, for cheap "already have it" checks and to
+    /// reject over-long responses.
+    pub size: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+pub struct Progress {
+    pub bytes_done: u64,
+    pub bytes_total: u64,
+    pub files_done: usize,
+    pub files_total: usize,
+}
+
+#[derive(Debug, Clone)]
+pub struct RetryPolicy {
+    pub attempts: u32,
+    pub base_delay: Duration,
+}
+
+impl Default for RetryPolicy {
+    fn default() -> Self {
+        Self {
+            attempts: 4,
+            base_delay: Duration::from_millis(500),
+        }
+    }
+}
+
+impl RetryPolicy {
+    /// Exponential backoff with up to 50% jitter, capped at 30 s.
+    fn delay(&self, attempt: u32) -> Duration {
+        let exp = self
+            .base_delay
+            .saturating_mul(2u32.saturating_pow(attempt))
+            .min(Duration::from_secs(30));
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |d| u64::from(d.subsec_nanos()));
+        // Cheap jitter: no need for a random-number crate to desynchronize retries.
+        let jitter = exp.as_nanos() as u64 / 2;
+        let extra = if jitter == 0 { 0 } else { nanos % jitter };
+        exp + Duration::from_nanos(extra)
+    }
+}
+
+/// Why one attempt failed, and whether trying again makes sense.
+enum Failure {
+    Retry(Error),
+    Fatal(Error),
+}
+
+struct Tracker {
+    bytes_done: AtomicU64,
+    bytes_total: u64,
+    files_done: AtomicUsize,
+    files_total: usize,
+    tx: Option<watch::Sender<Progress>>,
+}
+
+impl Tracker {
+    fn publish(&self) {
+        if let Some(tx) = &self.tx {
+            tx.send_replace(Progress {
+                bytes_done: self.bytes_done.load(Ordering::Relaxed),
+                bytes_total: self.bytes_total,
+                files_done: self.files_done.load(Ordering::Relaxed),
+                files_total: self.files_total,
+            });
+        }
+    }
+
+    fn add(&self, n: u64) {
+        self.bytes_done.fetch_add(n, Ordering::Relaxed);
+        self.publish();
+    }
+
+    fn sub(&self, n: u64) {
+        let _ = self
+            .bytes_done
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+                Some(v.saturating_sub(n))
+            });
+        self.publish();
+    }
+
+    fn file_done(&self) {
+        self.files_done.fetch_add(1, Ordering::Relaxed);
+        self.publish();
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct Downloader {
+    http: HttpClient,
+    max_concurrent: usize,
+    retry: RetryPolicy,
+}
+
+fn part_path(dest: &SafePath) -> PathBuf {
+    let mut name = dest.as_path().as_os_str().to_owned();
+    name.push(".part");
+    PathBuf::from(name)
+}
+
+fn io_err(e: std::io::Error) -> Error {
+    Error::Io(e)
+}
+
+impl Downloader {
+    /// `max_concurrent` is the `max_concurrent_downloads` setting (clamped to 1..=16).
+    pub fn new(http: HttpClient, max_concurrent: u8) -> Self {
+        Self {
+            http,
+            max_concurrent: usize::from(max_concurrent).clamp(1, 16),
+            retry: RetryPolicy::default(),
+        }
+    }
+
+    pub fn with_retry(mut self, retry: RetryPolicy) -> Self {
+        self.retry = retry;
+        self
+    }
+
+    /// Download every task, at most `max_concurrent` at a time. Stops at the first failure.
+    /// Tasks with the same destination are fetched once.
+    pub async fn download_all(
+        &self,
+        tasks: Vec<DownloadTask>,
+        progress: Option<watch::Sender<Progress>>,
+    ) -> Result<()> {
+        let mut seen = HashSet::new();
+        let tasks: Vec<DownloadTask> = tasks
+            .into_iter()
+            .filter(|t| seen.insert(t.dest.as_path().to_path_buf()))
+            .collect();
+        let tracker = Arc::new(Tracker {
+            bytes_done: AtomicU64::new(0),
+            bytes_total: tasks.iter().filter_map(|t| t.size).sum(),
+            files_done: AtomicUsize::new(0),
+            files_total: tasks.len(),
+            tx: progress,
+        });
+        tracker.publish();
+
+        let this = Arc::new(self.clone());
+        let limit = Arc::new(Semaphore::new(self.max_concurrent));
+        let mut set = JoinSet::new();
+        for task in tasks {
+            let (this, limit, tracker) = (this.clone(), limit.clone(), tracker.clone());
+            set.spawn(async move {
+                let _permit = limit
+                    .acquire_owned()
+                    .await
+                    .map_err(|e| Error::Io(std::io::Error::other(e)))?;
+                this.download_one(&task, &tracker).await
+            });
+        }
+        while let Some(joined) = set.join_next().await {
+            let outcome = joined.map_err(|e| Error::Io(std::io::Error::other(e)));
+            if let Err(e) | Ok(Err(e)) = outcome {
+                set.abort_all();
+                return Err(e);
+            }
+        }
+        Ok(())
+    }
+
+    /// Download a single file with no progress reporting.
+    pub async fn download(&self, task: DownloadTask) -> Result<()> {
+        self.download_all(vec![task], None).await
+    }
+
+    async fn download_one(&self, task: &DownloadTask, tracker: &Tracker) -> Result<()> {
+        if let Some(parent) = task.dest.as_path().parent() {
+            tokio::fs::create_dir_all(parent).await.map_err(io_err)?;
+        }
+        if is_already_present(task).await {
+            if let Some(size) = task.size {
+                tracker.add(size);
+            }
+            tracker.file_done();
+            return Ok(());
+        }
+        let mut counted = 0u64;
+        for attempt in 0..self.retry.attempts.max(1) {
+            match self.attempt(task, tracker, &mut counted).await {
+                Ok(()) => {
+                    tracker.file_done();
+                    return Ok(());
+                }
+                Err(Failure::Fatal(e)) => return Err(e),
+                Err(Failure::Retry(e)) => {
+                    if attempt + 1 >= self.retry.attempts.max(1) {
+                        return Err(e);
+                    }
+                    tracing::debug!(attempt, "download attempt failed; retrying");
+                    tokio::time::sleep(self.retry.delay(attempt)).await;
+                }
+            }
+        }
+        Err(Error::Http("download failed".into()))
+    }
+
+    async fn attempt(
+        &self,
+        task: &DownloadTask,
+        tracker: &Tracker,
+        counted: &mut u64,
+    ) -> std::result::Result<(), Failure> {
+        let part = part_path(&task.dest);
+        let mut existing = match tokio::fs::metadata(&part).await {
+            Ok(m) if m.is_file() => m.len(),
+            _ => 0,
+        };
+        // A leftover longer than the file can't be a prefix of it.
+        if task.size.is_some_and(|s| existing > s) {
+            discard(&part, tracker, counted).await;
+            existing = 0;
+        }
+        // Bytes counted by a failed earlier attempt are re-counted from the file.
+        tracker.sub(*counted);
+        *counted = 0;
+
+        let mut hasher = task.hash.as_ref().map(|h| StreamHasher::new(h.algo()));
+        let mut written = 0u64;
+
+        let complete_already = task.size == Some(existing) && existing > 0;
+        if complete_already {
+            written = prefix_into(&part, &mut hasher, tracker, counted).await?;
+        } else {
+            let mut stream = self
+                .http
+                .get_stream(&task.url, (existing > 0).then_some(existing))
+                .await
+                .map_err(Failure::Retry)?;
+            let resuming = match stream.status {
+                206 if stream.content_range_start == Some(existing) && existing > 0 => true,
+                200 => false,
+                416 => {
+                    discard(&part, tracker, counted).await;
+                    return Err(Failure::Retry(Error::Http(
+                        "the server rejected a resumed download".into(),
+                    )));
+                }
+                206 => {
+                    discard(&part, tracker, counted).await;
+                    return Err(Failure::Retry(Error::Http(
+                        "the server resumed at the wrong position".into(),
+                    )));
+                }
+                429 | 500..=599 => {
+                    return Err(Failure::Retry(Error::Http(format!(
+                        "the server is busy (HTTP {})",
+                        stream.status
+                    ))));
+                }
+                status => {
+                    return Err(Failure::Fatal(Error::Http(format!(
+                        "the server refused the download (HTTP {status})"
+                    ))));
+                }
+            };
+
+            let mut file = if resuming {
+                written = prefix_into(&part, &mut hasher, tracker, counted).await?;
+                tokio::fs::OpenOptions::new()
+                    .append(true)
+                    .open(&part)
+                    .await
+                    .map_err(|e| Failure::Retry(io_err(e)))?
+            } else {
+                tokio::fs::File::create(&part)
+                    .await
+                    .map_err(|e| Failure::Retry(io_err(e)))?
+            };
+
+            while let Some(chunk) = stream.next_chunk().await.map_err(Failure::Retry)? {
+                written += chunk.len() as u64;
+                if task.size.is_some_and(|s| written > s) {
+                    drop(file);
+                    discard(&part, tracker, counted).await;
+                    return Err(Failure::Retry(Error::Http(
+                        "the server sent more data than expected".into(),
+                    )));
+                }
+                if let Some(h) = hasher.as_mut() {
+                    h.update(&chunk);
+                }
+                file.write_all(&chunk)
+                    .await
+                    .map_err(|e| Failure::Fatal(io_err(e)))?;
+                tracker.add(chunk.len() as u64);
+                *counted += chunk.len() as u64;
+            }
+            file.flush().await.map_err(|e| Failure::Fatal(io_err(e)))?;
+        }
+
+        // A short body keeps its .part so the next attempt can resume.
+        if task.size.is_some_and(|s| written != s) {
+            return Err(Failure::Retry(Error::Http(
+                "the download ended early".into(),
+            )));
+        }
+        if let (Some(hasher), Some(expected)) = (hasher, &task.hash) {
+            let actual = hasher.finalize_hex();
+            if actual != expected.hex() {
+                discard(&part, tracker, counted).await;
+                return Err(Failure::Retry(Error::HashMismatch {
+                    expected: expected.hex().to_owned(),
+                    actual,
+                }));
+            }
+        }
+        tokio::fs::rename(&part, task.dest.as_path())
+            .await
+            .map_err(|e| Failure::Fatal(io_err(e)))?;
+        Ok(())
+    }
+}
+
+async fn is_already_present(task: &DownloadTask) -> bool {
+    let Ok(meta) = tokio::fs::metadata(task.dest.as_path()).await else {
+        return false;
+    };
+    if !meta.is_file() {
+        return false;
+    }
+    // Files only reach their final path after verification, so a size match is enough
+    // to skip them cheaply (this runs for thousands of assets on every launch).
+    if let Some(size) = task.size {
+        return meta.len() == size;
+    }
+    match &task.hash {
+        Some(h) => crate::hash::verify_file(task.dest.as_path(), h)
+            .await
+            .is_ok(),
+        None => false,
+    }
+}
+
+async fn discard(part: &Path, tracker: &Tracker, counted: &mut u64) {
+    let _ = tokio::fs::remove_file(part).await;
+    tracker.sub(*counted);
+    *counted = 0;
+}
+
+/// Feed the bytes already on disk into the hasher and count them as done.
+async fn prefix_into(
+    part: &Path,
+    hasher: &mut Option<StreamHasher>,
+    tracker: &Tracker,
+    counted: &mut u64,
+) -> std::result::Result<u64, Failure> {
+    let mut file = tokio::fs::File::open(part)
+        .await
+        .map_err(|e| Failure::Retry(io_err(e)))?;
+    let mut buf = vec![0u8; 64 * 1024];
+    let mut total = 0u64;
+    loop {
+        let n = file
+            .read(&mut buf)
+            .await
+            .map_err(|e| Failure::Retry(io_err(e)))?;
+        if n == 0 {
+            break;
+        }
+        if let Some(h) = hasher.as_mut() {
+            h.update(&buf[..n]);
+        }
+        total += n as u64;
+    }
+    tracker.add(total);
+    *counted += total;
+    Ok(total)
+}
+
+/// Put `src` at `dst` as a hard link, falling back to a copy when the two are on different
+/// filesystems (or the filesystem has no hard links). Used to share cached files between
+/// instances without duplicating them.
+pub fn link_or_copy(src: &Path, dst: &SafePath) -> Result<()> {
+    if let Some(parent) = dst.as_path().parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    match std::fs::remove_file(dst.as_path()) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e.into()),
+    }
+    if std::fs::hard_link(src, dst.as_path()).is_err() {
+        std::fs::copy(src, dst.as_path())?;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use wiremock::matchers::{header, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    use super::*;
+    use crate::hash::{hash_bytes, HashAlgo};
+    use crate::net::HostPolicy;
+
+    fn downloader() -> Downloader {
+        let http =
+            HttpClient::new_for_downloads("Kiln-test/0", HostPolicy::new(&[]).with_loopback_http())
+                .unwrap();
+        Downloader::new(http, 4).with_retry(RetryPolicy {
+            attempts: 3,
+            base_delay: Duration::from_millis(1),
+        })
+    }
+
+    fn data(n: usize) -> Vec<u8> {
+        (0..n).map(|i| (i % 251) as u8).collect()
+    }
+
+    fn task(server: &MockServer, root: &Path, name: &str, body: &[u8]) -> DownloadTask {
+        DownloadTask {
+            url: format!("{}/{name}", server.uri()),
+            dest: SafePath::new(root, name).unwrap(),
+            hash: Some(
+                ExpectedHash::new(HashAlgo::Sha1, &hash_bytes(HashAlgo::Sha1, body)).unwrap(),
+            ),
+            size: Some(body.len() as u64),
+        }
+    }
+
+    async fn requests(server: &MockServer) -> usize {
+        server.received_requests().await.unwrap().len()
+    }
+
+    #[tokio::test]
+    async fn downloads_verifies_and_leaves_no_part_file() {
+        let server = MockServer::start().await;
+        let dir = tempfile::tempdir().unwrap();
+        let body = data(100_000);
+        Mock::given(path("/a/f.bin"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(body.clone()))
+            .mount(&server)
+            .await;
+        let t = task(&server, dir.path(), "a/f.bin", &body);
+
+        let (tx, rx) = watch::channel(Progress::default());
+        downloader()
+            .download_all(vec![t.clone()], Some(tx))
+            .await
+            .unwrap();
+
+        assert_eq!(std::fs::read(t.dest.as_path()).unwrap(), body);
+        assert!(!part_path(&t.dest).exists());
+        let p = *rx.borrow();
+        assert_eq!(p.bytes_done, 100_000);
+        assert_eq!(p.bytes_total, 100_000);
+        assert_eq!((p.files_done, p.files_total), (1, 1));
+    }
+
+    #[tokio::test]
+    async fn a_hash_mismatch_discards_the_file_and_reports_it() {
+        let server = MockServer::start().await;
+        let dir = tempfile::tempdir().unwrap();
+        let good = data(5000);
+        let mut evil = good.clone();
+        evil[10] ^= 0xff;
+        Mock::given(path("/f.bin"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(evil))
+            .mount(&server)
+            .await;
+        let t = task(&server, dir.path(), "f.bin", &good);
+
+        let err = downloader().download(t.clone()).await.unwrap_err();
+        assert!(matches!(err, Error::HashMismatch { .. }), "{err:?}");
+        assert!(
+            !t.dest.as_path().exists(),
+            "unverified data must not be kept"
+        );
+        assert!(!part_path(&t.dest).exists());
+    }
+
+    #[tokio::test]
+    async fn an_interrupted_download_resumes_from_the_part_file() {
+        let server = MockServer::start().await;
+        let dir = tempfile::tempdir().unwrap();
+        let body = data(80_000);
+        Mock::given(path("/f.bin"))
+            .and(header("range", "bytes=30000-"))
+            .respond_with(
+                ResponseTemplate::new(206)
+                    .insert_header("content-range", "bytes 30000-79999/80000")
+                    .set_body_bytes(body[30_000..].to_vec()),
+            )
+            .mount(&server)
+            .await;
+        let t = task(&server, dir.path(), "f.bin", &body);
+        std::fs::write(part_path(&t.dest), &body[..30_000]).unwrap();
+
+        let (tx, rx) = watch::channel(Progress::default());
+        downloader()
+            .download_all(vec![t.clone()], Some(tx))
+            .await
+            .unwrap();
+
+        assert_eq!(std::fs::read(t.dest.as_path()).unwrap(), body);
+        assert_eq!(requests(&server).await, 1);
+        assert_eq!(rx.borrow().bytes_done, 80_000, "resumed bytes count once");
+    }
+
+    #[tokio::test]
+    async fn a_corrupt_part_file_is_caught_by_the_hash_and_redone_from_scratch() {
+        let server = MockServer::start().await;
+        let dir = tempfile::tempdir().unwrap();
+        let body = data(20_000);
+        Mock::given(path("/f.bin"))
+            .and(header("range", "bytes=5000-"))
+            .respond_with(
+                ResponseTemplate::new(206)
+                    .insert_header("content-range", "bytes 5000-19999/20000")
+                    .set_body_bytes(body[5000..].to_vec()),
+            )
+            .with_priority(1)
+            .mount(&server)
+            .await;
+        Mock::given(path("/f.bin"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(body.clone()))
+            .with_priority(2)
+            .mount(&server)
+            .await;
+        let t = task(&server, dir.path(), "f.bin", &body);
+        std::fs::write(part_path(&t.dest), vec![0u8; 5000]).unwrap(); // wrong prefix
+
+        downloader().download(t.clone()).await.unwrap();
+        assert_eq!(std::fs::read(t.dest.as_path()).unwrap(), body);
+    }
+
+    #[tokio::test]
+    async fn a_server_that_ignores_range_restarts_cleanly() {
+        let server = MockServer::start().await;
+        let dir = tempfile::tempdir().unwrap();
+        let body = data(40_000);
+        Mock::given(path("/f.bin"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(body.clone()))
+            .mount(&server)
+            .await;
+        let t = task(&server, dir.path(), "f.bin", &body);
+        std::fs::write(part_path(&t.dest), &body[..10_000]).unwrap();
+
+        downloader().download(t.clone()).await.unwrap();
+        assert_eq!(std::fs::read(t.dest.as_path()).unwrap(), body);
+    }
+
+    #[tokio::test]
+    async fn transient_server_errors_are_retried() {
+        let server = MockServer::start().await;
+        let dir = tempfile::tempdir().unwrap();
+        let body = data(1000);
+        Mock::given(path("/f.bin"))
+            .respond_with(ResponseTemplate::new(503))
+            .up_to_n_times(2)
+            .with_priority(1)
+            .mount(&server)
+            .await;
+        Mock::given(path("/f.bin"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(body.clone()))
+            .with_priority(2)
+            .mount(&server)
+            .await;
+        let t = task(&server, dir.path(), "f.bin", &body);
+        downloader().download(t.clone()).await.unwrap();
+        assert_eq!(requests(&server).await, 3);
+    }
+
+    #[tokio::test]
+    async fn client_errors_are_not_retried() {
+        let server = MockServer::start().await;
+        let dir = tempfile::tempdir().unwrap();
+        Mock::given(path("/f.bin"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&server)
+            .await;
+        let t = task(&server, dir.path(), "f.bin", b"x");
+        assert!(downloader().download(t).await.is_err());
+        assert_eq!(requests(&server).await, 1);
+    }
+
+    #[tokio::test]
+    async fn existing_files_of_the_right_size_are_not_downloaded_again() {
+        let server = MockServer::start().await;
+        let dir = tempfile::tempdir().unwrap();
+        let body = data(777);
+        let t = task(&server, dir.path(), "have.bin", &body);
+        std::fs::write(t.dest.as_path(), &body).unwrap();
+        downloader().download(t).await.unwrap();
+        assert_eq!(requests(&server).await, 0);
+    }
+
+    #[tokio::test]
+    async fn over_long_responses_are_rejected() {
+        let server = MockServer::start().await;
+        let dir = tempfile::tempdir().unwrap();
+        Mock::given(path("/f.bin"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(data(2000)))
+            .mount(&server)
+            .await;
+        let t = task(&server, dir.path(), "f.bin", &data(1000));
+        assert!(downloader().download(t.clone()).await.is_err());
+        assert!(!t.dest.as_path().exists());
+    }
+
+    #[tokio::test]
+    async fn many_files_download_in_parallel_and_duplicates_are_fetched_once() {
+        let server = MockServer::start().await;
+        let dir = tempfile::tempdir().unwrap();
+        let mut tasks = Vec::new();
+        for i in 0..20 {
+            let body = data(500 + i);
+            let name = format!("d/{i}.bin");
+            Mock::given(path(format!("/{name}")))
+                .respond_with(ResponseTemplate::new(200).set_body_bytes(body.clone()))
+                .mount(&server)
+                .await;
+            tasks.push(task(&server, dir.path(), &name, &body));
+        }
+        tasks.push(tasks[0].clone());
+        downloader().download_all(tasks, None).await.unwrap();
+        assert_eq!(requests(&server).await, 20);
+    }
+
+    #[test]
+    fn link_or_copy_replaces_the_destination() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("src.bin");
+        std::fs::write(&src, b"one").unwrap();
+        let dst = SafePath::new(dir.path(), "inst/lib/dst.bin").unwrap();
+        link_or_copy(&src, &dst).unwrap();
+        std::fs::write(&src, b"two").unwrap_or_default();
+        let dst2 = SafePath::new(dir.path(), "inst/lib/dst.bin").unwrap();
+        link_or_copy(&src, &dst2).unwrap();
+        assert_eq!(std::fs::read(dst2.as_path()).unwrap(), b"two");
+    }
+
+    #[test]
+    fn backoff_grows_and_is_capped() {
+        let p = RetryPolicy {
+            attempts: 10,
+            base_delay: Duration::from_millis(100),
+        };
+        assert!(p.delay(0) >= Duration::from_millis(100));
+        assert!(p.delay(3) >= Duration::from_millis(800));
+        assert!(p.delay(20) <= Duration::from_secs(45));
+    }
+}
+
+<<<<<KILN-END>>>>>
+<<<<<KILN-FILE crates/kiln-core/src/java.rs>>>>>
+//! Java runtimes: find ones already installed, or download Eclipse Temurin into `java/`.
+//!
+//! Downloads come from the Adoptium API, which publishes a SHA-256 for each package; the
+//! package is verified by the downloader before it is unpacked. The download host
+//! allowlist (GitHub) is only ever used by this module's own client.
+
+use std::path::{Path, PathBuf};
+use std::time::Duration;
+
+use reqwest::Method;
+use serde::Deserialize;
+use tokio::sync::watch;
+
+use crate::archive::{extract_tar_gz, extract_zip, ExtractOptions};
+use crate::db::Db;
+use crate::download::{DownloadTask, Downloader, Progress};
+use crate::hash::{hash_bytes, ExpectedHash, HashAlgo};
+use crate::launch::LaunchError;
+use crate::net::{Body, HostPolicy, HttpClient};
+use crate::paths::SafePath;
+use crate::{Error, Result, APP_NAME, APP_VERSION};
+
+pub const ADOPTIUM_API: &str = "https://api.adoptium.net";
+
+pub fn api_policy() -> HostPolicy {
+    HostPolicy::new(&["api.adoptium.net"])
+}
+
+/// Temurin package links redirect from github.com to GitHub's release CDN. The package's
+/// SHA-256 is checked, so these hosts can't substitute a different file.
+pub fn download_policy() -> HostPolicy {
+    HostPolicy::new(&[
+        "github.com",
+        "objects.githubusercontent.com",
+        "release-assets.githubusercontent.com",
+    ])
+}
+
+/// Extract the major version from the output of `java -version`.
+pub fn parse_java_major(output: &str) -> Option<u32> {
+    let start = output.find("version \"")? + "version \"".len();
+    let rest = &output[start..];
+    let version = &rest[..rest.find('"')?];
+    let mut parts = version.split(['.', '-', '_', '+']);
+    let first: u32 = parts.next()?.parse().ok()?;
+    // Java 8 and earlier call themselves "1.8.0_x".
+    if first == 1 {
+        parts.next()?.parse().ok()
+    } else {
+        Some(first)
+    }
+}
+
+/// The `java` executable inside a JDK/JRE home folder, if there is one.
+pub fn java_executable_in(home: &Path) -> Option<PathBuf> {
+    let exe = if cfg!(windows) { "java.exe" } else { "java" };
+    [
+        home.join("bin").join(exe),
+        home.join("Contents").join("Home").join("bin").join(exe),
+    ]
+    .into_iter()
+    .find(|p| p.is_file())
+}
+
+/// Run `java -version` and report the major version. Fails if it doesn't run in 10 s.
+pub async fn probe(java: &Path) -> Result<u32> {
+    let mut cmd = tokio::process::Command::new(java);
+    cmd.arg("-version").kill_on_drop(true);
+    crate::launch::hide_console_window(&mut cmd);
+    let output = tokio::time::timeout(Duration::from_secs(10), cmd.output())
+        .await
+        .map_err(|_| LaunchError::BadJava("it did not answer".into()))?
+        .map_err(|e| LaunchError::BadJava(e.kind().to_string()))?;
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stderr),
+        String::from_utf8_lossy(&output.stdout)
+    );
+    parse_java_major(&text)
+        .ok_or_else(|| LaunchError::BadJava("unrecognised version output".into()).into())
+}
+
+/// Places a JDK is commonly installed.
+fn candidate_executables() -> Vec<PathBuf> {
+    let mut homes: Vec<PathBuf> = Vec::new();
+    if let Some(home) = std::env::var_os("JAVA_HOME") {
+        homes.push(PathBuf::from(home));
+    }
+    let mut add_children = |dir: &str, suffix: &[&str]| {
+        if let Ok(entries) = std::fs::read_dir(dir) {
+            for e in entries.flatten() {
+                let mut p = e.path();
+                p.extend(suffix);
+                homes.push(p);
+            }
+        }
+    };
+    add_children("/usr/lib/jvm", &[]);
+    add_children("/Library/Java/JavaVirtualMachines", &["Contents", "Home"]);
+    for base in [
+        "C:\\Program Files\\Eclipse Adoptium",
+        "C:\\Program Files\\Java",
+        "C:\\Program Files\\Microsoft",
+        "C:\\Program Files\\Zulu",
+    ] {
+        add_children(base, &[]);
+    }
+    let mut found: Vec<PathBuf> = homes.iter().filter_map(|h| java_executable_in(h)).collect();
+    if let Some(path) = std::env::var_os("PATH") {
+        let exe = if cfg!(windows) { "java.exe" } else { "java" };
+        found.extend(
+            std::env::split_paths(&path)
+                .map(|d| d.join(exe))
+                .filter(|p| p.is_file()),
+        );
+    }
+    // The same JDK is often reachable by several routes.
+    let mut seen = std::collections::HashSet::new();
+    found.retain(|p| seen.insert(p.canonicalize().unwrap_or_else(|_| p.clone())));
+    found
+}
+
+#[derive(Deserialize)]
+struct Asset {
+    binary: Binary,
+}
+
+#[derive(Deserialize)]
+struct Binary {
+    package: Package,
+}
+
+#[derive(Deserialize)]
+struct Package {
+    link: String,
+    name: String,
+    checksum: String,
+    size: u64,
+}
+
+/// Adoptium's names for this computer, or `None` if it publishes no build for it.
+fn adoptium_platform() -> Option<(&'static str, &'static str)> {
+    let os = match std::env::consts::OS {
+        "linux" => "linux",
+        "macos" => "mac",
+        "windows" => "windows",
+        _ => return None,
+    };
+    let arch = match std::env::consts::ARCH {
+        "x86_64" => "x64",
+        "aarch64" => "aarch64",
+        _ => return None,
+    };
+    Some((os, arch))
+}
+
+#[derive(Debug, Clone)]
+pub struct JavaManager {
+    db: Db,
+    java_dir: PathBuf,
+    api: HttpClient,
+    downloader: Downloader,
+    api_base: String,
+}
+
+impl JavaManager {
+    pub fn new(db: Db, java_dir: &Path, max_concurrent: u8) -> Result<Self> {
+        let ua = format!("{APP_NAME}/{APP_VERSION}");
+        Ok(Self::with_clients(
+            db,
+            java_dir,
+            HttpClient::new(&ua, api_policy())?,
+            Downloader::new(
+                HttpClient::new_for_downloads(&ua, download_policy())?,
+                max_concurrent,
+            ),
+            ADOPTIUM_API.into(),
+        ))
+    }
+
+    pub(crate) fn with_clients(
+        db: Db,
+        java_dir: &Path,
+        api: HttpClient,
+        downloader: Downloader,
+        api_base: String,
+    ) -> Self {
+        Self {
+            db,
+            java_dir: java_dir.to_path_buf(),
+            api,
+            downloader,
+            api_base,
+        }
+    }
+
+    /// A `java` executable of exactly this major version: one Kiln already knows about, one
+    /// installed on the system, or a fresh Temurin download, in that order.
+    pub async fn ensure(
+        &self,
+        major: u32,
+        progress: Option<watch::Sender<Progress>>,
+    ) -> Result<PathBuf> {
+        if let Some(path) = self.known(major).await? {
+            return Ok(path);
+        }
+        for candidate in candidate_executables() {
+            if probe(&candidate).await.is_ok_and(|m| m == major) {
+                self.record(&candidate, "System", major, false).await?;
+                return Ok(candidate);
+            }
+        }
+        self.install_temurin(major, progress).await
+    }
+
+    /// The executable of a recorded runtime, if it is known and still on disk.
+    pub async fn runtime_path(&self, id: &str) -> Result<Option<PathBuf>> {
+        let row: Option<(String,)> = sqlx::query_as("SELECT path FROM java_runtimes WHERE id = ?1")
+            .bind(id)
+            .fetch_optional(&self.db)
+            .await?;
+        Ok(row.map(|(p,)| PathBuf::from(p)).filter(|p| p.is_file()))
+    }
+
+    /// A recorded runtime whose file still exists (the user may have uninstalled it).
+    async fn known(&self, major: u32) -> Result<Option<PathBuf>> {
+        let rows: Vec<(String,)> =
+            sqlx::query_as("SELECT path FROM java_runtimes WHERE major = ?1 ORDER BY managed DESC")
+                .bind(i64::from(major))
+                .fetch_all(&self.db)
+                .await?;
+        Ok(rows
+            .into_iter()
+            .map(|(p,)| PathBuf::from(p))
+            .find(|p| p.is_file()))
+    }
+
+    async fn record(&self, exe: &Path, vendor: &str, major: u32, managed: bool) -> Result<()> {
+        let path = exe.to_string_lossy().into_owned();
+        let id = hash_bytes(HashAlgo::Sha1, path.as_bytes());
+        sqlx::query(
+            "INSERT INTO java_runtimes (id, vendor, major, path, managed) VALUES (?1, ?2, ?3, ?4, ?5) \
+             ON CONFLICT (path) DO UPDATE SET vendor = excluded.vendor, major = excluded.major, \
+             managed = excluded.managed",
+        )
+        .bind(id)
+        .bind(vendor)
+        .bind(i64::from(major))
+        .bind(path)
+        .bind(i64::from(managed))
+        .execute(&self.db)
+        .await?;
+        Ok(())
+    }
+
+    async fn find_package(&self, major: u32) -> Result<Package> {
+        let (os, arch) = adoptium_platform().ok_or(LaunchError::NoJavaBuild(major))?;
+        let url = format!(
+            "{}/v3/assets/latest/{major}/hotspot?architecture={arch}&image_type=jre&os={os}&vendor=eclipse",
+            self.api_base
+        );
+        let resp = self
+            .api
+            .execute(Method::GET, &url, Body::Empty, None)
+            .await?;
+        if !resp.is_success() {
+            return Err(Error::Http(format!(
+                "Adoptium answered HTTP {}",
+                resp.status
+            )));
+        }
+        let assets: Vec<Asset> = resp.json()?;
+        assets
+            .into_iter()
+            .next()
+            .map(|a| a.binary.package)
+            .ok_or_else(|| LaunchError::NoJavaBuild(major).into())
+    }
+
+    async fn install_temurin(
+        &self,
+        major: u32,
+        progress: Option<watch::Sender<Progress>>,
+    ) -> Result<PathBuf> {
+        let package = self.find_package(major).await?;
+        if package.name.contains(['/', '\\']) {
+            return Err(Error::InvalidPath("package name".into()));
+        }
+        let archive = SafePath::new(&self.java_dir, &format!("downloads/{}", package.name))?;
+        self.downloader
+            .download_all(
+                vec![DownloadTask {
+                    url: package.link,
+                    dest: archive.clone(),
+                    hash: Some(ExpectedHash::new(HashAlgo::Sha256, &package.checksum)?),
+                    size: Some(package.size),
+                }],
+                progress,
+            )
+            .await?;
+
+        let staging = self.java_dir.join(format!("{major}.tmp"));
+        let target = self.java_dir.join(major.to_string());
+        let (archive_path, staging_path) = (archive.as_path().to_path_buf(), staging.clone());
+        let name = package.name.clone();
+        tokio::task::spawn_blocking(move || -> Result<()> {
+            let _ = std::fs::remove_dir_all(&staging_path);
+            let opts = ExtractOptions {
+                strip_components: 1,
+                ..Default::default()
+            };
+            if name.ends_with(".zip") {
+                extract_zip(&archive_path, &staging_path, &opts)?;
+            } else if name.ends_with(".tar.gz") || name.ends_with(".tgz") {
+                extract_tar_gz(&archive_path, &staging_path, &opts)?;
+            } else {
+                return Err(Error::Archive("unknown package format".into()));
+            }
+            Ok(())
+        })
+        .await
+        .map_err(|e| Error::Io(std::io::Error::other(e)))??;
+
+        // Check the unpacked runtime before it replaces anything.
+        let staged_exe = java_executable_in(&staging)
+            .ok_or_else(|| LaunchError::BadJava("the package has no java executable".into()))?;
+        let actual = probe(&staged_exe).await?;
+        if actual != major {
+            let _ = std::fs::remove_dir_all(&staging);
+            return Err(
+                LaunchError::BadJava(format!("expected Java {major}, got {actual}")).into(),
+            );
+        }
+        let _ = std::fs::remove_dir_all(&target);
+        std::fs::rename(&staging, &target)?;
+        let _ = std::fs::remove_file(archive.as_path());
+
+        let exe = java_executable_in(&target)
+            .ok_or_else(|| LaunchError::BadJava("the java executable went missing".into()))?;
+        self.record(&exe, "Eclipse Temurin", major, true).await?;
+        tracing::info!(major, "installed a Java runtime");
+        Ok(exe)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::Write;
+
+    use serde_json::json;
+    use wiremock::matchers::{method, path, query_param};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    use super::*;
+    use crate::db;
+    use crate::download::RetryPolicy;
+
+    #[test]
+    fn version_output_parsing() {
+        assert_eq!(
+            parse_java_major("openjdk version \"17.0.9\" 2023-10-17"),
+            Some(17)
+        );
+        assert_eq!(parse_java_major("java version \"1.8.0_392\""), Some(8));
+        assert_eq!(
+            parse_java_major("openjdk version \"21\" 2023-09-19"),
+            Some(21)
+        );
+        assert_eq!(parse_java_major("openjdk version \"22-ea\" 2024"), Some(22));
+        assert_eq!(parse_java_major("openjdk version \"1.8.0+5\""), Some(8));
+        assert_eq!(parse_java_major("bash: java: not found"), None);
+        assert_eq!(parse_java_major("version \"abc\""), None);
+    }
+
+    fn fake_jre_tar_gz(major: u32) -> Vec<u8> {
+        let script = format!("#!/bin/sh\necho 'openjdk version \"{major}.0.1\" 2024-01-01' >&2\n");
+        let gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+        let mut b = tar::Builder::new(gz);
+        let mut h = tar::Header::new_gnu();
+        h.set_size(script.len() as u64);
+        h.set_mode(0o755);
+        h.set_cksum();
+        b.append_data(
+            &mut h,
+            format!("jdk-{major}-jre/bin/java"),
+            script.as_bytes(),
+        )
+        .unwrap();
+        b.into_inner().unwrap().finish().unwrap()
+    }
+
+    async fn manager(server: &MockServer) -> (JavaManager, tempfile::TempDir, Db) {
+        let dir = tempfile::tempdir().unwrap();
+        let db = db::open_in_memory().await.unwrap();
+        let policy = || HostPolicy::new(&[]).with_loopback_http();
+        let mgr = JavaManager::with_clients(
+            db.clone(),
+            dir.path(),
+            HttpClient::new("t/0", policy()).unwrap(),
+            Downloader::new(HttpClient::new_for_downloads("t/0", policy()).unwrap(), 2).with_retry(
+                RetryPolicy {
+                    attempts: 2,
+                    base_delay: Duration::from_millis(1),
+                },
+            ),
+            server.uri(),
+        );
+        (mgr, dir, db)
+    }
+
+    async fn mount_package(server: &MockServer, major: u32, tarball: &[u8], checksum: &str) {
+        Mock::given(method("GET"))
+            .and(path(format!("/v3/assets/latest/{major}/hotspot")))
+            .and(query_param("image_type", "jre"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!([{
+                "binary": {"package": {
+                    "link": format!("{}/pkg/jre.tar.gz", server.uri()),
+                    "name": "jre.tar.gz", "checksum": checksum, "size": tarball.len(),
+                }}
+            }])))
+            .mount(server)
+            .await;
+        Mock::given(path("/pkg/jre.tar.gz"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(tarball.to_vec()))
+            .mount(server)
+            .await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn installs_a_verified_runtime_records_it_and_reuses_it() {
+        // Only meaningful where this computer is a platform Adoptium publishes for.
+        if adoptium_platform().is_none() {
+            return;
+        }
+        let server = MockServer::start().await;
+        let tarball = fake_jre_tar_gz(97);
+        mount_package(
+            &server,
+            97,
+            &tarball,
+            &hash_bytes(HashAlgo::Sha256, &tarball),
+        )
+        .await;
+        let (mgr, dir, db) = manager(&server).await;
+
+        let exe = mgr.ensure(97, None).await.unwrap();
+        assert_eq!(exe, dir.path().join("97/bin/java"));
+        assert_eq!(probe(&exe).await.unwrap(), 97);
+        assert!(
+            !dir.path().join("downloads/jre.tar.gz").exists(),
+            "archive is cleaned up"
+        );
+        assert!(!dir.path().join("97.tmp").exists());
+        let (managed,): (i64,) =
+            sqlx::query_as("SELECT managed FROM java_runtimes WHERE major = 97")
+                .fetch_one(&db)
+                .await
+                .unwrap();
+        assert_eq!(managed, 1);
+
+        // A second call is served from the database: no more network traffic.
+        let before = server.received_requests().await.unwrap().len();
+        assert_eq!(mgr.ensure(97, None).await.unwrap(), exe);
+        assert_eq!(server.received_requests().await.unwrap().len(), before);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_package_with_the_wrong_checksum_is_never_unpacked() {
+        if adoptium_platform().is_none() {
+            return;
+        }
+        let server = MockServer::start().await;
+        let tarball = fake_jre_tar_gz(96);
+        mount_package(&server, 96, &tarball, &"0".repeat(64)).await;
+        let (mgr, dir, _db) = manager(&server).await;
+
+        let err = mgr.ensure(96, None).await.unwrap_err();
+        assert!(matches!(err, Error::HashMismatch { .. }), "{err:?}");
+        assert!(!dir.path().join("96").exists() && !dir.path().join("96.tmp").exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_runtime_of_the_wrong_version_is_rejected() {
+        if adoptium_platform().is_none() {
+            return;
+        }
+        let server = MockServer::start().await;
+        let tarball = fake_jre_tar_gz(11); // claims to be Java 11
+        mount_package(
+            &server,
+            95,
+            &tarball,
+            &hash_bytes(HashAlgo::Sha256, &tarball),
+        )
+        .await;
+        let (mgr, dir, _db) = manager(&server).await;
+
+        let err = mgr.ensure(95, None).await.unwrap_err();
+        assert!(
+            matches!(err, Error::Launch(LaunchError::BadJava(_))),
+            "{err:?}"
+        );
+        assert!(!dir.path().join("95").exists());
+    }
+
+    #[tokio::test]
+    async fn no_published_build_gives_a_clear_error() {
+        let server = MockServer::start().await;
+        Mock::given(path("/v3/assets/latest/94/hotspot"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!([])))
+            .mount(&server)
+            .await;
+        let (mgr, _dir, _db) = manager(&server).await;
+        let err = mgr.find_package(94).await;
+        if adoptium_platform().is_some() {
+            assert!(matches!(
+                err,
+                Err(Error::Launch(LaunchError::NoJavaBuild(94)))
+            ));
+        }
+    }
+
+    #[test]
+    fn executable_lookup_checks_the_macos_layout() {
+        let dir = tempfile::tempdir().unwrap();
+        let exe = if cfg!(windows) { "java.exe" } else { "java" };
+        assert!(java_executable_in(dir.path()).is_none());
+        let bin = dir.path().join("Contents/Home/bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::File::create(bin.join(exe))
+            .unwrap()
+            .write_all(b"x")
+            .unwrap();
+        assert!(java_executable_in(dir.path()).is_some());
+    }
+}
+
+<<<<<KILN-END>>>>>
+<<<<<KILN-FILE crates/kiln-core/src/mojang/mod.rs>>>>>
+//! Mojang's launcher metadata: the version manifest, per-version JSON, asset indexes, and
+//! the download tasks for the client jar, libraries and assets.
+//!
+//! Everything fetched here is verified against the SHA-1 Mojang publishes and cached under
+//! `cache/{meta,versions,libraries,assets,jars}`.
+
+pub mod rules;
+pub mod version;
+
+use std::path::{Path, PathBuf};
+
+use reqwest::Method;
+use serde::{Deserialize, Serialize};
+
+use crate::download::{DownloadTask, Downloader};
+use crate::hash::{ExpectedHash, HashAlgo};
+use crate::launch::LaunchError;
+use crate::net::{Body, HostPolicy, HttpClient};
+use crate::paths::SafePath;
+use crate::{Error, Result, APP_NAME, APP_VERSION};
+
+pub use version::{AssetIndex, LibraryFile, ResolvedLibraries, VersionJson};
+
+pub const MANIFEST_URL: &str = "https://piston-meta.mojang.com/mc/game/version_manifest_v2.json";
+pub const ASSET_BASE: &str = "https://resources.download.minecraft.net/";
+/// Refuse version JSON files larger than this (real ones are well under 1 MiB).
+const MAX_JSON_BYTES: u64 = 8 * 1024 * 1024;
+
+/// The only hosts the Mojang clients may contact.
+pub fn host_policy() -> HostPolicy {
+    HostPolicy::new(&[
+        "piston-meta.mojang.com",
+        "piston-data.mojang.com",
+        "launchermeta.mojang.com",
+        "launcher.mojang.com",
+        "libraries.minecraft.net",
+        "resources.download.minecraft.net",
+    ])
+}
+
+/// Version ids become folder and file names, so keep them boring.
+pub fn is_valid_version_id(id: &str) -> bool {
+    (1..=64).contains(&id.len())
+        && !id.starts_with('.')
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-' | b'+'))
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Latest {
+    pub release: String,
+    pub snapshot: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VersionEntry {
+    pub id: String,
+    #[serde(rename = "type")]
+    pub kind: String,
+    pub url: String,
+    pub sha1: String,
+    #[serde(rename = "releaseTime")]
+    pub release_time: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VersionManifest {
+    pub latest: Latest,
+    pub versions: Vec<VersionEntry>,
+}
+
+/// What the UI is told about a version. No URLs or hashes cross IPC.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct VersionSummary {
+    pub id: String,
+    pub kind: String,
+    pub release_time: String,
+}
+
+impl VersionManifest {
+    pub fn summaries(&self) -> Vec<VersionSummary> {
+        self.versions
+            .iter()
+            .filter(|v| is_valid_version_id(&v.id))
+            .map(|v| VersionSummary {
+                id: v.id.clone(),
+                kind: v.kind.clone(),
+                release_time: v.release_time.clone(),
+            })
+            .collect()
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct MojangClient {
+    api: HttpClient,
+    downloader: Downloader,
+    cache: PathBuf,
+    manifest_url: String,
+    asset_base: String,
+}
+
+fn sha1_of(hex: &str) -> Result<ExpectedHash> {
+    ExpectedHash::new(HashAlgo::Sha1, hex)
+}
+
+impl MojangClient {
+    pub fn new(cache: &Path, max_concurrent: u8) -> Result<Self> {
+        let ua = format!("{APP_NAME}/{APP_VERSION}");
+        Ok(Self::with_clients(
+            HttpClient::new(&ua, host_policy())?,
+            Downloader::new(
+                HttpClient::new_for_downloads(&ua, host_policy())?,
+                max_concurrent,
+            ),
+            cache,
+            MANIFEST_URL.into(),
+            ASSET_BASE.into(),
+        ))
+    }
+
+    pub(crate) fn with_clients(
+        api: HttpClient,
+        downloader: Downloader,
+        cache: &Path,
+        manifest_url: String,
+        asset_base: String,
+    ) -> Self {
+        Self {
+            api,
+            downloader,
+            cache: cache.to_path_buf(),
+            manifest_url,
+            asset_base,
+        }
+    }
+
+    pub fn downloader(&self) -> &Downloader {
+        &self.downloader
+    }
+
+    /// A folder under the cache, created on demand (`SafePath` needs its root to exist).
+    pub fn cache_dir(&self, name: &str) -> Result<PathBuf> {
+        let dir = self.cache.join(name);
+        std::fs::create_dir_all(&dir)?;
+        Ok(dir)
+    }
+
+    fn task(
+        &self,
+        folder: &str,
+        rel: &str,
+        url: &str,
+        sha1: &str,
+        size: Option<u64>,
+    ) -> Result<DownloadTask> {
+        Ok(DownloadTask {
+            url: url.to_owned(),
+            dest: SafePath::new(&self.cache_dir(folder)?, rel)?,
+            hash: Some(sha1_of(sha1)?),
+            size,
+        })
+    }
+
+    /// The version list. Falls back to the copy saved by the last successful fetch when
+    /// Mojang can't be reached, so installed versions still launch offline.
+    pub async fn manifest(&self) -> Result<VersionManifest> {
+        let saved = self.cache_dir("meta")?.join("version_manifest_v2.json");
+        let fetched = match self
+            .api
+            .execute(Method::GET, &self.manifest_url, Body::Empty, None)
+            .await
+        {
+            Ok(resp) if resp.is_success() => resp.json::<VersionManifest>(),
+            Ok(resp) => Err(Error::Http(format!("Mojang answered HTTP {}", resp.status))),
+            Err(e) => Err(e),
+        };
+        match fetched {
+            Ok(manifest) => {
+                let tmp = saved.with_extension("json.tmp");
+                std::fs::write(&tmp, serde_json::to_vec(&manifest)?)?;
+                std::fs::rename(&tmp, &saved)?;
+                Ok(manifest)
+            }
+            Err(e) => match std::fs::read(&saved) {
+                Ok(bytes) => {
+                    tracing::warn!("using the saved version list: Mojang could not be reached");
+                    Ok(serde_json::from_slice(&bytes)?)
+                }
+                Err(_) => Err(e),
+            },
+        }
+    }
+
+    pub async fn version_json(&self, id: &str) -> Result<VersionJson> {
+        if !is_valid_version_id(id) {
+            return Err(LaunchError::InvalidVersionId.into());
+        }
+        let dest = SafePath::new(&self.cache_dir("versions")?, &format!("{id}/{id}.json"))?;
+        match self.manifest().await {
+            Ok(manifest) => {
+                let entry = manifest
+                    .versions
+                    .iter()
+                    .find(|v| v.id == id)
+                    .ok_or_else(|| LaunchError::UnknownVersion(id.to_owned()))?;
+                let task = DownloadTask {
+                    url: entry.url.clone(),
+                    dest: dest.clone(),
+                    hash: Some(sha1_of(&entry.sha1)?),
+                    size: None,
+                };
+                self.downloader.download(task).await?;
+            }
+            // Offline: a previously verified copy is still good.
+            Err(e) if !dest.as_path().is_file() => return Err(e),
+            Err(_) => {}
+        }
+        read_json(dest.as_path())
+    }
+
+    pub async fn asset_index(&self, version: &VersionJson) -> Result<AssetIndex> {
+        let r = version.asset_index_ref()?;
+        if !is_valid_version_id(&r.id) {
+            return Err(LaunchError::InvalidVersionId.into());
+        }
+        let task = self.task(
+            "assets",
+            &format!("indexes/{}.json", r.id),
+            &r.url,
+            &r.sha1,
+            Some(r.size),
+        )?;
+        let dest = task.dest.clone();
+        self.downloader.download(task).await?;
+        let index: AssetIndex = read_json(dest.as_path())?;
+        if index.is_virtual || index.map_to_resources {
+            return Err(LaunchError::LegacyAssets(version.id.clone()).into());
+        }
+        Ok(index)
+    }
+
+    pub fn asset_tasks(&self, index: &AssetIndex) -> Result<Vec<DownloadTask>> {
+        index
+            .objects
+            .values()
+            .map(|o| {
+                let hash = sha1_of(&o.hash)?;
+                let prefix = &hash.hex()[..2];
+                Ok(DownloadTask {
+                    url: format!("{}{prefix}/{}", self.asset_base, hash.hex()),
+                    dest: SafePath::new(
+                        &self.cache_dir("assets")?,
+                        &format!("objects/{prefix}/{}", hash.hex()),
+                    )?,
+                    size: Some(o.size),
+                    hash: Some(hash),
+                })
+            })
+            .collect()
+    }
+
+    /// Where a library lives (or will live) in the shared libraries cache.
+    pub fn library_path(&self, lib: &LibraryFile) -> Result<SafePath> {
+        SafePath::new(&self.cache_dir("libraries")?, &lib.path)
+    }
+
+    pub fn library_task(&self, lib: &LibraryFile) -> Result<DownloadTask> {
+        self.task("libraries", &lib.path, &lib.url, &lib.sha1, lib.size)
+    }
+
+    /// Where the client jar lives once downloaded, and the task to fetch it.
+    pub fn client_jar_task(&self, version: &VersionJson) -> Result<DownloadTask> {
+        let client = &version
+            .downloads
+            .as_ref()
+            .ok_or_else(|| LaunchError::UnsupportedLibrary(format!("{} client jar", version.id)))?
+            .client;
+        self.task(
+            "jars",
+            &format!("{0}/{0}.jar", version.id),
+            &client.url,
+            &client.sha1,
+            client.size,
+        )
+    }
+
+    pub fn assets_root(&self) -> Result<PathBuf> {
+        self.cache_dir("assets")
+    }
+}
+
+fn read_json<T: serde::de::DeserializeOwned>(path: &Path) -> Result<T> {
+    if std::fs::metadata(path)?.len() > MAX_JSON_BYTES {
+        return Err(Error::Json(
+            <serde_json::Error as serde::de::Error>::custom("metadata file is too large"),
+        ));
+    }
+    Ok(serde_json::from_slice(&std::fs::read(path)?)?)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn version_ids_are_safe_file_names() {
+        for ok in [
+            "1.21.1",
+            "24w14a",
+            "1.20.1-forge-47.2.0",
+            "1.7.10_pre4",
+            "a+b",
+        ] {
+            assert!(is_valid_version_id(ok), "{ok}");
+        }
+        for bad in [
+            "",
+            ".",
+            "..",
+            ".hidden",
+            "a/b",
+            "a\\b",
+            "a b",
+            "../x",
+            &"a".repeat(65),
+            "x:y",
+            "naïve",
+        ] {
+            assert!(!is_valid_version_id(bad), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn summaries_hide_urls_and_drop_unsafe_ids() {
+        let entry = |id: &str| VersionEntry {
+            id: id.into(),
+            kind: "release".into(),
+            url: "https://piston-meta.mojang.com/x".into(),
+            sha1: "a".repeat(40),
+            release_time: "2024-01-01T00:00:00+00:00".into(),
+        };
+        let m = VersionManifest {
+            latest: Latest {
+                release: "1.21.1".into(),
+                snapshot: "1.21.1".into(),
+            },
+            versions: vec![entry("1.21.1"), entry("../evil")],
+        };
+        let s = m.summaries();
+        assert_eq!(s.len(), 1);
+        assert!(!serde_json::to_string(&s).unwrap().contains("piston"));
+    }
+}
+
+<<<<<KILN-END>>>>>
+<<<<<KILN-FILE crates/kiln-core/src/mojang/rules.rs>>>>>
+//! Mojang's `rules` mechanism: which libraries and arguments apply to this computer.
+//!
+//! A list with no rules always applies. Otherwise it starts as "not allowed" and each rule
+//! that matches this environment sets the outcome to its action, so the last match wins.
+
+use std::collections::{HashMap, HashSet};
+
+use regex::RegexBuilder;
+use serde::Deserialize;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Os {
+    Windows,
+    MacOs,
+    Linux,
+}
+
+impl Os {
+    pub fn current() -> Self {
+        if cfg!(target_os = "windows") {
+            Self::Windows
+        } else if cfg!(target_os = "macos") {
+            Self::MacOs
+        } else {
+            Self::Linux
+        }
+    }
+
+    /// The name Mojang's manifests use.
+    pub fn mojang_name(self) -> &'static str {
+        match self {
+            Self::Windows => "windows",
+            Self::MacOs => "osx",
+            Self::Linux => "linux",
+        }
+    }
+}
+
+/// What the rules are evaluated against.
+#[derive(Debug, Clone)]
+pub struct Environment {
+    pub os: Os,
+    /// `x86` (32-bit), `x86_64` or `arm64`: the spellings Mojang's manifests use.
+    pub arch: String,
+    /// Matched by the `os.version` regex. Windows reports `10.0` for both 10 and 11; other
+    /// systems are left unset, so version-restricted rules don't match there.
+    pub os_version: Option<String>,
+    /// Launcher features switched on (`has_custom_resolution`, `is_demo_user`, ...).
+    pub features: HashSet<String>,
+}
+
+impl Environment {
+    pub fn current() -> Self {
+        let os = Os::current();
+        let arch = match std::env::consts::ARCH {
+            "aarch64" => "arm64",
+            "x86" => "x86",
+            _ => "x86_64",
+        };
+        Self {
+            os,
+            arch: arch.into(),
+            os_version: (os == Os::Windows).then(|| "10.0".into()),
+            features: HashSet::new(),
+        }
+    }
+
+    /// Value substituted for `${arch}` in old-style native classifiers.
+    pub fn bits(&self) -> &'static str {
+        if self.arch == "x86" {
+            "32"
+        } else {
+            "64"
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Action {
+    Allow,
+    Disallow,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct OsRule {
+    pub name: Option<String>,
+    pub arch: Option<String>,
+    pub version: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct Rule {
+    pub action: Action,
+    #[serde(default)]
+    pub os: Option<OsRule>,
+    #[serde(default)]
+    pub features: Option<HashMap<String, bool>>,
+}
+
+impl OsRule {
+    fn matches(&self, env: &Environment) -> bool {
+        if self
+            .name
+            .as_deref()
+            .is_some_and(|n| n != env.os.mojang_name())
+        {
+            return false;
+        }
+        if self.arch.as_deref().is_some_and(|a| a != env.arch) {
+            return false;
+        }
+        match (&self.version, &env.os_version) {
+            (None, _) => true,
+            (Some(_), None) => false,
+            // The pattern comes from a downloaded file: cap its compiled size.
+            (Some(pattern), Some(version)) => RegexBuilder::new(pattern)
+                .size_limit(100_000)
+                .build()
+                .is_ok_and(|re| re.is_match(version)),
+        }
+    }
+}
+
+impl Rule {
+    fn matches(&self, env: &Environment) -> bool {
+        self.os.as_ref().is_none_or(|os| os.matches(env))
+            && self
+                .features
+                .as_ref()
+                .is_none_or(|f| f.iter().all(|(k, v)| env.features.contains(k) == *v))
+    }
+}
+
+pub fn rules_allow(rules: &[Rule], env: &Environment) -> bool {
+    if rules.is_empty() {
+        return true;
+    }
+    let mut allowed = false;
+    for rule in rules.iter().filter(|r| r.matches(env)) {
+        allowed = rule.action == Action::Allow;
+    }
+    allowed
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::*;
+
+    fn env(os: Os, arch: &str) -> Environment {
+        Environment {
+            os,
+            arch: arch.into(),
+            os_version: (os == Os::Windows).then(|| "10.0".into()),
+            features: HashSet::new(),
+        }
+    }
+
+    fn rules(v: serde_json::Value) -> Vec<Rule> {
+        serde_json::from_value(v).unwrap()
+    }
+
+    #[test]
+    fn no_rules_means_allowed() {
+        assert!(rules_allow(&[], &env(Os::Linux, "x86_64")));
+    }
+
+    #[test]
+    fn os_rules_select_the_platform() {
+        let r = rules(json!([{"action": "allow", "os": {"name": "osx"}}]));
+        assert!(rules_allow(&r, &env(Os::MacOs, "arm64")));
+        assert!(!rules_allow(&r, &env(Os::Linux, "x86_64")));
+    }
+
+    #[test]
+    fn disallow_after_allow_wins_and_order_matters() {
+        let r = rules(json!([
+            {"action": "allow"},
+            {"action": "disallow", "os": {"name": "osx"}}
+        ]));
+        assert!(rules_allow(&r, &env(Os::Linux, "x86_64")));
+        assert!(!rules_allow(&r, &env(Os::MacOs, "x86_64")));
+        // Reversed: the final unconditional allow overrides.
+        let r = rules(json!([
+            {"action": "disallow", "os": {"name": "osx"}},
+            {"action": "allow"}
+        ]));
+        assert!(rules_allow(&r, &env(Os::MacOs, "x86_64")));
+    }
+
+    #[test]
+    fn arch_rules_distinguish_32_bit_and_arm() {
+        let r = rules(json!([{"action": "allow", "os": {"name": "windows", "arch": "x86"}}]));
+        assert!(rules_allow(&r, &env(Os::Windows, "x86")));
+        assert!(!rules_allow(&r, &env(Os::Windows, "x86_64")));
+        let r = rules(json!([{"action": "allow", "os": {"name": "osx", "arch": "arm64"}}]));
+        assert!(rules_allow(&r, &env(Os::MacOs, "arm64")));
+        assert!(!rules_allow(&r, &env(Os::MacOs, "x86_64")));
+    }
+
+    #[test]
+    fn version_regex_needs_a_known_version() {
+        let r = rules(json!([{"action": "allow", "os": {"name": "windows", "version": "^10\\."}}]));
+        assert!(rules_allow(&r, &env(Os::Windows, "x86_64")));
+        let mut old = env(Os::Windows, "x86_64");
+        old.os_version = Some("6.1".into());
+        assert!(!rules_allow(&r, &old));
+        assert!(!rules_allow(&r, &env(Os::Linux, "x86_64")));
+    }
+
+    #[test]
+    fn a_hostile_regex_cannot_hang_or_panic() {
+        let r = rules(json!([{"action": "allow", "os": {"version": "(((((((((("}}]));
+        let mut e = env(Os::Windows, "x86_64");
+        e.os_version = Some("10.0".into());
+        assert!(!rules_allow(&r, &e));
+        let huge = "a{1000}{1000}{1000}".to_string();
+        let r = rules(json!([{"action": "allow", "os": {"version": huge}}]));
+        assert!(!rules_allow(&r, &e));
+    }
+
+    #[test]
+    fn feature_rules_follow_enabled_features() {
+        let r = rules(json!([{"action": "allow", "features": {"has_custom_resolution": true}}]));
+        let mut e = env(Os::Linux, "x86_64");
+        assert!(!rules_allow(&r, &e));
+        e.features.insert("has_custom_resolution".into());
+        assert!(rules_allow(&r, &e));
+        let demo_off = rules(json!([{"action": "allow", "features": {"is_demo_user": false}}]));
+        assert!(rules_allow(&demo_off, &e));
+        e.features.insert("is_demo_user".into());
+        assert!(!rules_allow(&demo_off, &e));
+    }
+}
+
+<<<<<KILN-END>>>>>
+<<<<<KILN-FILE crates/kiln-core/src/mojang/version.rs>>>>>
+//! Mojang's per-version JSON: libraries, natives, arguments, assets and the client jar.
+
+use std::collections::HashMap;
+
+use serde::Deserialize;
+
+use super::rules::{rules_allow, Environment, Rule};
+use crate::launch::LaunchError;
+use crate::Result;
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VersionJson {
+    pub id: String,
+    #[serde(rename = "type")]
+    pub kind: String,
+    pub main_class: String,
+    #[serde(default)]
+    pub arguments: Option<Arguments>,
+    /// Versions before 1.13 use one string instead of `arguments`.
+    #[serde(default)]
+    pub minecraft_arguments: Option<String>,
+    /// Absent in loader profiles, which inherit it from the vanilla version.
+    #[serde(default)]
+    pub asset_index: Option<AssetIndexRef>,
+    #[serde(default)]
+    pub downloads: Option<VersionDownloads>,
+    #[serde(default)]
+    pub libraries: Vec<Library>,
+    #[serde(default)]
+    pub java_version: Option<JavaVersion>,
+    /// Loader profiles (Fabric, Forge) build on a vanilla version. Phase 4.
+    #[serde(default)]
+    pub inherits_from: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct JavaVersion {
+    pub major_version: u32,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct AssetIndexRef {
+    pub id: String,
+    pub sha1: String,
+    pub size: u64,
+    pub url: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct VersionDownloads {
+    pub client: FileRef,
+}
+
+/// A downloadable file as Mojang describes it.
+#[derive(Debug, Clone, Deserialize)]
+pub struct FileRef {
+    #[serde(default)]
+    pub path: Option<String>,
+    pub sha1: String,
+    /// Loader-generated entries may not know their size.
+    #[serde(default)]
+    pub size: Option<u64>,
+    pub url: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct Arguments {
+    #[serde(default)]
+    pub game: Vec<Argument>,
+    #[serde(default)]
+    pub jvm: Vec<Argument>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+pub enum Argument {
+    Plain(String),
+    Conditional { rules: Vec<Rule>, value: OneOrMany },
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+pub enum OneOrMany {
+    One(String),
+    Many(Vec<String>),
+}
+
+impl Argument {
+    /// The argument strings this entry contributes in `env` (none if its rules say no).
+    pub fn values(&self, env: &Environment) -> Vec<&str> {
+        match self {
+            Self::Plain(s) => vec![s.as_str()],
+            Self::Conditional { rules, value } if rules_allow(rules, env) => match value {
+                OneOrMany::One(s) => vec![s.as_str()],
+                OneOrMany::Many(v) => v.iter().map(String::as_str).collect(),
+            },
+            Self::Conditional { .. } => Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct Library {
+    pub name: String,
+    #[serde(default)]
+    pub downloads: Option<LibraryDownloads>,
+    #[serde(default)]
+    pub rules: Vec<Rule>,
+    /// Old-style natives: OS name to classifier, e.g. `linux` to `natives-linux`.
+    #[serde(default)]
+    pub natives: Option<HashMap<String, String>>,
+    #[serde(default)]
+    pub extract: Option<Extract>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct LibraryDownloads {
+    pub artifact: Option<FileRef>,
+    #[serde(default)]
+    pub classifiers: Option<HashMap<String, FileRef>>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct Extract {
+    #[serde(default)]
+    pub exclude: Vec<String>,
+}
+
+/// A library file with a guaranteed relative path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LibraryFile {
+    /// Relative to the libraries cache. Untrusted: build paths with `SafePath` only.
+    pub path: String,
+    pub url: String,
+    pub sha1: String,
+    pub size: Option<u64>,
+}
+
+/// The libraries that apply here, split by how they are used.
+#[derive(Debug, Clone, Default)]
+pub struct ResolvedLibraries {
+    pub classpath: Vec<LibraryFile>,
+    /// Jars to unpack into the natives folder, with the entry-name prefixes to skip.
+    pub natives: Vec<(LibraryFile, Vec<String>)>,
+}
+
+fn to_file(name: &str, f: &FileRef) -> Result<LibraryFile> {
+    let path = f
+        .path
+        .clone()
+        .ok_or_else(|| LaunchError::UnsupportedLibrary(name.to_owned()))?;
+    Ok(LibraryFile {
+        path,
+        url: f.url.clone(),
+        sha1: f.sha1.clone(),
+        size: f.size,
+    })
+}
+
+impl VersionJson {
+    pub fn asset_index_ref(&self) -> Result<&AssetIndexRef> {
+        self.asset_index.as_ref().ok_or_else(|| {
+            LaunchError::UnsupportedLibrary(format!("{} (no asset index)", self.id)).into()
+        })
+    }
+
+    /// Combine a loader profile (`self`, which names its parent in `inheritsFrom`) with the
+    /// vanilla version it builds on. The loader's main class wins, argument lists are
+    /// concatenated parent first, and the loader's libraries come first on the classpath
+    /// (replacing any parent library with the same `group:artifact`).
+    pub fn merged_onto(&self, parent: &VersionJson) -> VersionJson {
+        let ga = |name: &str| name.splitn(3, ':').take(2).collect::<Vec<_>>().join(":");
+        let child_keys: std::collections::HashSet<String> =
+            self.libraries.iter().map(|l| ga(&l.name)).collect();
+        let mut libraries = self.libraries.clone();
+        libraries.extend(
+            parent
+                .libraries
+                .iter()
+                .filter(|l| !child_keys.contains(&ga(&l.name)))
+                .cloned(),
+        );
+        let arguments = match (&parent.arguments, &self.arguments) {
+            (Some(p), Some(c)) => Some(Arguments {
+                jvm: p.jvm.iter().chain(&c.jvm).cloned().collect(),
+                game: p.game.iter().chain(&c.game).cloned().collect(),
+            }),
+            (Some(p), None) => Some(p.clone()),
+            (None, Some(c)) => Some(c.clone()),
+            (None, None) => None,
+        };
+        VersionJson {
+            id: self.id.clone(),
+            kind: self.kind.clone(),
+            main_class: self.main_class.clone(),
+            minecraft_arguments: if arguments.is_some() {
+                None
+            } else {
+                self.minecraft_arguments
+                    .clone()
+                    .or_else(|| parent.minecraft_arguments.clone())
+            },
+            arguments,
+            asset_index: self
+                .asset_index
+                .clone()
+                .or_else(|| parent.asset_index.clone()),
+            downloads: self.downloads.clone().or_else(|| parent.downloads.clone()),
+            libraries,
+            java_version: self
+                .java_version
+                .clone()
+                .or_else(|| parent.java_version.clone()),
+            inherits_from: None,
+        }
+    }
+
+    /// Java major version the game needs. Versions without the field predate it: Java 8.
+    pub fn java_major(&self) -> u32 {
+        self.java_version.as_ref().map_or(8, |j| j.major_version)
+    }
+
+    pub fn resolve_libraries(&self, env: &Environment) -> Result<ResolvedLibraries> {
+        let mut out = ResolvedLibraries::default();
+        for lib in &self.libraries {
+            if !rules_allow(&lib.rules, env) {
+                continue;
+            }
+            let downloads = lib.downloads.as_ref();
+            let classifier = lib.natives.as_ref().and_then(|n| {
+                n.get(env.os.mojang_name())
+                    .map(|c| c.replace("${arch}", env.bits()))
+            });
+            if let Some(classifier) = &classifier {
+                // A natives library for another platform just doesn't apply here.
+                if let Some(file) = downloads
+                    .and_then(|d| d.classifiers.as_ref())
+                    .and_then(|c| c.get(classifier))
+                {
+                    let exclude = lib.extract.clone().unwrap_or_default().exclude;
+                    out.natives.push((to_file(&lib.name, file)?, exclude));
+                }
+            }
+            match downloads.and_then(|d| d.artifact.as_ref()) {
+                Some(artifact) => {
+                    let file = to_file(&lib.name, artifact)?;
+                    if !out.classpath.iter().any(|f| f.path == file.path) {
+                        out.classpath.push(file);
+                    }
+                }
+                // A library with natives only has no jar of its own for the classpath.
+                None if lib.natives.is_some() => {}
+                None => return Err(LaunchError::UnsupportedLibrary(lib.name.clone()).into()),
+            }
+        }
+        Ok(out)
+    }
+}
+
+/// `group:artifact:version[:classifier][@ext]` to its Maven repository path.
+pub fn maven_path(name: &str) -> Option<String> {
+    let (coords, ext) = name.split_once('@').unwrap_or((name, "jar"));
+    let parts: Vec<&str> = coords.split(':').collect();
+    if !(3..=4).contains(&parts.len()) || parts.iter().any(|p| p.is_empty()) || ext.is_empty() {
+        return None;
+    }
+    let (group, artifact, version) = (parts[0].replace('.', "/"), parts[1], parts[2]);
+    let file = match parts.get(3) {
+        Some(classifier) => format!("{artifact}-{version}-{classifier}.{ext}"),
+        None => format!("{artifact}-{version}.{ext}"),
+    };
+    Some(format!("{group}/{artifact}/{version}/{file}"))
+}
+
+/// Asset index: asset name to content hash.
+#[derive(Debug, Clone, Deserialize)]
+pub struct AssetIndex {
+    pub objects: HashMap<String, AssetObject>,
+    /// Pre-1.7 layouts need files copied to readable names. Not supported yet.
+    #[serde(default, rename = "virtual")]
+    pub is_virtual: bool,
+    #[serde(default)]
+    pub map_to_resources: bool,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct AssetObject {
+    pub hash: String,
+    pub size: u64,
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::*;
+    use crate::mojang::rules::Os;
+
+    fn env(os: Os) -> Environment {
+        Environment {
+            os,
+            arch: "x86_64".into(),
+            os_version: None,
+            features: Default::default(),
+        }
+    }
+
+    fn lib(v: serde_json::Value) -> serde_json::Value {
+        v
+    }
+
+    fn version(libs: Vec<serde_json::Value>) -> VersionJson {
+        serde_json::from_value(json!({
+            "id": "1.21.1", "type": "release", "mainClass": "net.minecraft.client.main.Main",
+            "assetIndex": {"id": "17", "sha1": "a".repeat(40), "size": 1, "url": "https://x/i.json"},
+            "libraries": libs,
+        }))
+        .unwrap()
+    }
+
+    fn art(path: &str) -> serde_json::Value {
+        json!({"path": path, "sha1": "b".repeat(40), "size": 10, "url": format!("https://libraries.minecraft.net/{path}")})
+    }
+
+    #[test]
+    fn plain_and_rule_gated_libraries() {
+        let v = version(vec![
+            lib(
+                json!({"name": "a:plain:1", "downloads": {"artifact": art("a/plain/1/plain-1.jar")}}),
+            ),
+            lib(
+                json!({"name": "a:mac:1", "downloads": {"artifact": art("a/mac/1/mac-1.jar")},
+                "rules": [{"action": "allow", "os": {"name": "osx"}}]}),
+            ),
+            lib(
+                json!({"name": "a:notmac:1", "downloads": {"artifact": art("a/notmac/1/notmac-1.jar")},
+                "rules": [{"action": "allow"}, {"action": "disallow", "os": {"name": "osx"}}]}),
+            ),
+        ]);
+        let linux = v.resolve_libraries(&env(Os::Linux)).unwrap();
+        let names: Vec<_> = linux.classpath.iter().map(|f| f.path.as_str()).collect();
+        assert_eq!(names, ["a/plain/1/plain-1.jar", "a/notmac/1/notmac-1.jar"]);
+        let mac = v.resolve_libraries(&env(Os::MacOs)).unwrap();
+        let names: Vec<_> = mac.classpath.iter().map(|f| f.path.as_str()).collect();
+        assert_eq!(names, ["a/plain/1/plain-1.jar", "a/mac/1/mac-1.jar"]);
+    }
+
+    #[test]
+    fn old_style_natives_pick_the_platform_classifier() {
+        let v = version(vec![lib(json!({
+            "name": "org.lwjgl:lwjgl-platform:2.9.4",
+            "natives": {"linux": "natives-linux", "windows": "natives-windows-${arch}"},
+            "extract": {"exclude": ["META-INF/"]},
+            "downloads": {
+                "artifact": art("org/lwjgl/lwjgl-platform/2.9.4/lwjgl-platform-2.9.4.jar"),
+                "classifiers": {
+                    "natives-linux": art("org/lwjgl/lwjgl-platform/2.9.4/lwjgl-platform-2.9.4-natives-linux.jar"),
+                    "natives-windows-64": art("org/lwjgl/lwjgl-platform/2.9.4/lwjgl-platform-2.9.4-natives-windows-64.jar")
+                }
+            }
+        }))]);
+        let r = v.resolve_libraries(&env(Os::Linux)).unwrap();
+        assert_eq!(r.classpath.len(), 1);
+        assert_eq!(r.natives.len(), 1);
+        assert!(r.natives[0].0.path.ends_with("natives-linux.jar"));
+        assert_eq!(r.natives[0].1, ["META-INF/"]);
+        let r = v.resolve_libraries(&env(Os::Windows)).unwrap();
+        assert!(r.natives[0].0.path.ends_with("natives-windows-64.jar"));
+        // macOS has no entry in the natives map: nothing to extract, jar still on classpath.
+        let r = v.resolve_libraries(&env(Os::MacOs)).unwrap();
+        assert!(r.natives.is_empty());
+    }
+
+    #[test]
+    fn natives_only_libraries_have_no_classpath_entry() {
+        let v = version(vec![lib(json!({
+            "name": "x:y:1", "natives": {"linux": "natives-linux"},
+            "downloads": {"classifiers": {"natives-linux": art("x/y/1/y-1-natives-linux.jar")}}
+        }))]);
+        let r = v.resolve_libraries(&env(Os::Linux)).unwrap();
+        assert!(r.classpath.is_empty());
+        assert_eq!(r.natives.len(), 1);
+    }
+
+    #[test]
+    fn libraries_without_download_info_are_reported_not_skipped() {
+        let v = version(vec![lib(
+            json!({"name": "net.fabricmc:fabric-loader:0.15", "url": "https://maven.fabricmc.net/"}),
+        )]);
+        let err = v.resolve_libraries(&env(Os::Linux)).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                crate::Error::Launch(LaunchError::UnsupportedLibrary(_))
+            ),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn duplicate_classpath_entries_are_dropped() {
+        let one = lib(json!({"name": "a:b:1", "downloads": {"artifact": art("a/b/1/b-1.jar")}}));
+        let v = version(vec![one.clone(), one]);
+        assert_eq!(
+            v.resolve_libraries(&env(Os::Linux))
+                .unwrap()
+                .classpath
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn modern_arguments_parse_plain_conditional_and_list_values() {
+        let v: VersionJson = serde_json::from_value(json!({
+            "id": "1.21.1", "type": "release", "mainClass": "M",
+            "assetIndex": {"id": "17", "sha1": "a".repeat(40), "size": 1, "url": "https://x/i.json"},
+            "javaVersion": {"component": "java-runtime-delta", "majorVersion": 21},
+            "arguments": {
+                "game": ["--username", "${auth_player_name}",
+                    {"rules": [{"action": "allow", "features": {"has_custom_resolution": true}}],
+                     "value": ["--width", "${resolution_width}"]}],
+                "jvm": [{"rules": [{"action": "allow", "os": {"name": "osx"}}], "value": "-XstartOnFirstThread"},
+                        "-cp", "${classpath}"]
+            }
+        }))
+        .unwrap();
+        assert_eq!(v.java_major(), 21);
+        let args = v.arguments.unwrap();
+        let linux = env(Os::Linux);
+        let game: Vec<_> = args.game.iter().flat_map(|a| a.values(&linux)).collect();
+        assert_eq!(game, ["--username", "${auth_player_name}"]);
+        let jvm: Vec<_> = args.jvm.iter().flat_map(|a| a.values(&linux)).collect();
+        assert_eq!(jvm, ["-cp", "${classpath}"]);
+        let mac: Vec<_> = args
+            .jvm
+            .iter()
+            .flat_map(|a| a.values(&env(Os::MacOs)))
+            .collect();
+        assert_eq!(mac[0], "-XstartOnFirstThread");
+    }
+
+    #[test]
+    fn missing_java_version_means_java_8() {
+        assert_eq!(version(vec![]).java_major(), 8);
+    }
+
+    #[test]
+    fn asset_index_parses_flags() {
+        let idx: AssetIndex = serde_json::from_value(json!({
+            "objects": {"icons/a.png": {"hash": "a".repeat(40), "size": 5}}, "virtual": true
+        }))
+        .unwrap();
+        assert!(idx.is_virtual && !idx.map_to_resources);
+    }
+
+    #[test]
+    fn maven_coordinates_become_repository_paths() {
+        assert_eq!(
+            maven_path("net.fabricmc:fabric-loader:0.16.5").as_deref(),
+            Some("net/fabricmc/fabric-loader/0.16.5/fabric-loader-0.16.5.jar")
+        );
+        assert_eq!(
+            maven_path("a.b:c:1:natives-linux").as_deref(),
+            Some("a/b/c/1/c-1-natives-linux.jar")
+        );
+        assert_eq!(
+            maven_path("net.minecraft:client:1.20.1:mappings@txt").as_deref(),
+            Some("net/minecraft/client/1.20.1/client-1.20.1-mappings.txt")
+        );
+        for bad in ["", "a:b", "a:b:", "a:b:c:d:e", "a:b:c@"] {
+            assert_eq!(maven_path(bad), None, "{bad}");
+        }
+    }
+
+    #[test]
+    fn a_loader_profile_merges_onto_its_parent() {
+        let parent = version(vec![
+            lib(
+                json!({"name": "org.ow2.asm:asm:9.3", "downloads": {"artifact": art("org/ow2/asm/asm/9.3/asm-9.3.jar")}}),
+            ),
+            lib(
+                json!({"name": "a:other:1", "downloads": {"artifact": art("a/other/1/other-1.jar")}}),
+            ),
+        ]);
+        let parent: VersionJson = {
+            let mut p = parent;
+            p.arguments = Some(Arguments {
+                jvm: vec![Argument::Plain("-Pjvm".into())],
+                game: vec![Argument::Plain("--pgame".into())],
+            });
+            p
+        };
+        let child: VersionJson = serde_json::from_value(json!({
+            "id": "fabric-loader-0.16.5-1.21.1", "type": "release", "inheritsFrom": "1.21.1",
+            "mainClass": "net.fabricmc.loader.impl.launch.knot.KnotClient",
+            "arguments": {"jvm": ["-Cjvm"], "game": []},
+            "libraries": [{"name": "org.ow2.asm:asm:9.7", "downloads": {"artifact": art("org/ow2/asm/asm/9.7/asm-9.7.jar")}},
+                          {"name": "net.fabricmc:fabric-loader:0.16.5", "downloads": {"artifact": art("net/fabricmc/fabric-loader/0.16.5/fabric-loader-0.16.5.jar")}}]
+        })).unwrap();
+        let m = child.merged_onto(&parent);
+        assert_eq!(m.id, "fabric-loader-0.16.5-1.21.1");
+        assert_eq!(
+            m.main_class,
+            "net.fabricmc.loader.impl.launch.knot.KnotClient"
+        );
+        assert!(m.inherits_from.is_none());
+        assert_eq!(
+            m.asset_index.as_ref().unwrap().id,
+            "17",
+            "inherited from the parent"
+        );
+        let names: Vec<_> = m.libraries.iter().map(|l| l.name.as_str()).collect();
+        assert_eq!(
+            names,
+            [
+                "org.ow2.asm:asm:9.7",
+                "net.fabricmc:fabric-loader:0.16.5",
+                "a:other:1"
+            ],
+            "child first, same group:artifact replaced"
+        );
+        let a = m.arguments.unwrap();
+        let env = env(Os::Linux);
+        assert_eq!(
+            a.jvm
+                .iter()
+                .flat_map(|x| x.values(&env))
+                .collect::<Vec<_>>(),
+            ["-Pjvm", "-Cjvm"]
+        );
+        assert_eq!(
+            a.game
+                .iter()
+                .flat_map(|x| x.values(&env))
+                .collect::<Vec<_>>(),
+            ["--pgame"]
+        );
+    }
+}
+
+<<<<<KILN-END>>>>>
