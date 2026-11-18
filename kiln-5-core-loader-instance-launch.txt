@@ -1,0 +1,4957 @@
+Kiln source bundle 5 of 9: kiln-core loaders, instances and launch: Fabric/Quilt/Forge/NeoForge, packs, launch pipeline.
+Rebuild the repository by running `python3 restore.py` next to these files. Text before the first marker is ignored.
+
+<<<<<KILN-FILE crates/kiln-core/src/instance/mod.rs>>>>>
+//! Instances: isolated game folders, each with its own Minecraft version, mod loader, mods,
+//! resource packs, shaders, saves, options and Java settings.
+//!
+//! The folder lives under `instances/<slug>-<id>` (the `dir` column holds only that relative
+//! name, so portable installs stay relocatable). The display name is separate from the folder
+//! name, so renaming never moves files.
+
+pub mod pack;
+
+use std::path::Path;
+
+use serde::Serialize;
+use sqlx::FromRow;
+
+use crate::db::Db;
+use crate::launch::LaunchError;
+use crate::loader::LoaderKind;
+use crate::mojang::is_valid_version_id;
+use crate::paths::SafePath;
+use crate::{Error, Result};
+
+/// Created inside every new instance.
+pub const SUBDIRS: &[&str] = &["mods", "resourcepacks", "shaderpacks", "saves", "config"];
+/// Not copied when cloning or exporting: regenerated, or private to one machine.
+pub const TRANSIENT: &[&str] = &[".kiln-natives", "logs", "crash-reports"];
+const MAX_NAME_CHARS: usize = 64;
+const MAX_JVM_ARGS_BYTES: usize = 2048;
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct Instance {
+    pub id: String,
+    pub name: String,
+    pub mc_version: String,
+    pub loader: LoaderKind,
+    pub loader_version: Option<String>,
+    pub java_id: Option<String>,
+    pub jvm_args: Option<String>,
+    pub ram_mb: Option<u32>,
+    pub created_at: i64,
+    pub last_played: Option<i64>,
+    pub playtime_s: i64,
+}
+
+#[derive(Debug, Clone)]
+pub struct NewInstance {
+    pub name: String,
+    pub mc_version: String,
+    pub loader: LoaderKind,
+    pub loader_version: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct InstanceSettings {
+    pub ram_mb: Option<u32>,
+    pub jvm_args: Option<String>,
+    pub java_id: Option<String>,
+}
+
+#[derive(FromRow)]
+struct Row {
+    id: String,
+    name: String,
+    mc_version: String,
+    loader: String,
+    loader_version: Option<String>,
+    java_id: Option<String>,
+    jvm_args: Option<String>,
+    ram_mb: Option<i64>,
+    created_at: i64,
+    last_played: Option<i64>,
+    playtime_s: i64,
+}
+
+impl From<Row> for Instance {
+    fn from(r: Row) -> Self {
+        Self {
+            id: r.id,
+            name: r.name,
+            mc_version: r.mc_version,
+            loader: LoaderKind::parse(&r.loader).unwrap_or(LoaderKind::Vanilla),
+            loader_version: r.loader_version,
+            java_id: r.java_id,
+            jvm_args: r.jvm_args,
+            ram_mb: r.ram_mb.and_then(|v| u32::try_from(v).ok()),
+            created_at: r.created_at,
+            last_played: r.last_played,
+            playtime_s: r.playtime_s,
+        }
+    }
+}
+
+const COLUMNS: &str = "id, name, mc_version, loader, loader_version, java_id, jvm_args, ram_mb, created_at, last_played, playtime_s";
+
+fn now_unix() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX))
+}
+
+pub fn validate_name(name: &str) -> Result<String> {
+    let name = name.trim();
+    if name.is_empty()
+        || name.chars().count() > MAX_NAME_CHARS
+        || name.chars().any(char::is_control)
+    {
+        return Err(LaunchError::InvalidName.into());
+    }
+    Ok(name.to_owned())
+}
+
+/// A folder-name-safe version of a display name.
+pub(crate) fn slug(name: &str) -> String {
+    let s: String = name
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() {
+                c.to_ascii_lowercase()
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    let s = s
+        .split('-')
+        .filter(|p| !p.is_empty())
+        .collect::<Vec<_>>()
+        .join("-");
+    let s: String = s.chars().take(32).collect();
+    if s.is_empty() {
+        "instance".into()
+    } else {
+        s
+    }
+}
+
+/// Flags that load code or run commands, or override how Java finds its own libraries.
+const DENIED: &[&str] = &[
+    "javaagent",
+    "agentlib",
+    "agentpath",
+    "bootclasspath",
+    "-xrun",
+    "xx:on",
+    "xx:vmoptionsfile",
+    "xx:flags",
+    "xx:args",
+    "xx:errorfile",
+    "xx:heapdumppath",
+    "java.library.path",
+    "java.class.path",
+    "java.system.class.loader",
+    "jdk.module",
+    "java.ext.dirs",
+    "java.home",
+    "sun.boot",
+    "java.security",
+];
+const ALLOWED_PREFIXES: &[&str] = &[
+    "-xmx", "-xms", "-xss", "-xmn", "-xx:", "-xshare:", "-xlog:", "-d",
+];
+
+/// Split and vet user-supplied JVM arguments. Not a sandbox (the game itself runs with the
+/// user's privileges), but IPC must not be a way to inject agents or shell commands.
+pub fn parse_jvm_args(args: &str) -> Result<Vec<String>> {
+    let bad = |why: &str| -> Error { LaunchError::InvalidJvmArgs(why.into()).into() };
+    if args.len() > MAX_JVM_ARGS_BYTES {
+        return Err(bad("too long"));
+    }
+    if args
+        .chars()
+        .any(|c| c.is_control() && c != ' ' && c != '\t')
+    {
+        return Err(bad("control characters"));
+    }
+    let tokens: Vec<String> = args.split_whitespace().map(str::to_owned).collect();
+    for t in &tokens {
+        let lower = t.to_ascii_lowercase();
+        if !ALLOWED_PREFIXES.iter().any(|p| lower.starts_with(p)) {
+            return Err(bad(&format!("{t} isn't a recognised option")));
+        }
+        if DENIED.iter().any(|d| lower.contains(d)) {
+            return Err(bad(&format!(
+                "{t} could load code or change Java's own paths"
+            )));
+        }
+    }
+    Ok(tokens)
+}
+
+#[derive(Debug, Clone)]
+pub struct InstanceStore {
+    db: Db,
+    root: std::path::PathBuf,
+}
+
+impl InstanceStore {
+    pub fn new(db: Db, instances_dir: &Path) -> Self {
+        Self {
+            db,
+            root: instances_dir.to_path_buf(),
+        }
+    }
+
+    pub async fn list(&self) -> Result<Vec<Instance>> {
+        let rows: Vec<Row> = sqlx::query_as(&format!(
+            "SELECT {COLUMNS} FROM instances ORDER BY COALESCE(last_played, created_at) DESC, name COLLATE NOCASE"
+        ))
+        .fetch_all(&self.db)
+        .await?;
+        Ok(rows.into_iter().map(Instance::from).collect())
+    }
+
+    pub async fn get(&self, id: &str) -> Result<Instance> {
+        let row: Option<Row> =
+            sqlx::query_as(&format!("SELECT {COLUMNS} FROM instances WHERE id = ?1"))
+                .bind(id)
+                .fetch_optional(&self.db)
+                .await?;
+        row.map(Instance::from)
+            .ok_or_else(|| LaunchError::InstanceNotFound.into())
+    }
+
+    /// The instance's folder, proven to be inside `instances/`.
+    pub async fn game_dir(&self, id: &str) -> Result<SafePath> {
+        let dir: Option<(String,)> = sqlx::query_as("SELECT dir FROM instances WHERE id = ?1")
+            .bind(id)
+            .fetch_optional(&self.db)
+            .await?;
+        let (dir,) = dir.ok_or(LaunchError::InstanceNotFound)?;
+        SafePath::new(&self.root, &dir)
+    }
+
+    pub async fn create(&self, new: NewInstance) -> Result<Instance> {
+        let name = validate_name(&new.name)?;
+        if !is_valid_version_id(&new.mc_version) {
+            return Err(LaunchError::InvalidVersionId.into());
+        }
+        match (new.loader, new.loader_version.as_deref()) {
+            (LoaderKind::Vanilla, None) => {}
+            (LoaderKind::Vanilla, Some(_)) | (_, None) => {
+                return Err(LaunchError::InvalidVersionId.into())
+            }
+            (_, Some(v)) if is_valid_version_id(v) => {}
+            _ => return Err(LaunchError::InvalidVersionId.into()),
+        }
+        let id = uuid::Uuid::new_v4().simple().to_string();
+        let dir = format!("{}-{}", slug(&name), &id[..8]);
+        let game_dir = SafePath::new(&self.root, &dir)?;
+        sqlx::query(
+            "INSERT INTO instances (id, name, mc_version, loader, loader_version, created_at, dir) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        )
+        .bind(&id)
+        .bind(&name)
+        .bind(&new.mc_version)
+        .bind(new.loader.as_str())
+        .bind(&new.loader_version)
+        .bind(now_unix())
+        .bind(&dir)
+        .execute(&self.db)
+        .await?;
+        let made: std::io::Result<()> = SUBDIRS
+            .iter()
+            .try_for_each(|s| std::fs::create_dir_all(game_dir.as_path().join(s)));
+        if let Err(e) = made {
+            let _ = sqlx::query("DELETE FROM instances WHERE id = ?1")
+                .bind(&id)
+                .execute(&self.db)
+                .await;
+            return Err(e.into());
+        }
+        self.get(&id).await
+    }
+
+    pub async fn rename(&self, id: &str, name: &str) -> Result<Instance> {
+        let name = validate_name(name)?;
+        let done = sqlx::query("UPDATE instances SET name = ?2 WHERE id = ?1")
+            .bind(id)
+            .bind(&name)
+            .execute(&self.db)
+            .await?;
+        if done.rows_affected() == 0 {
+            return Err(LaunchError::InstanceNotFound.into());
+        }
+        self.get(id).await
+    }
+
+    /// Delete the instance and everything in its folder. `running` is whether the game is
+    /// currently running from it.
+    pub async fn delete(&self, id: &str, running: bool) -> Result<()> {
+        if running {
+            return Err(LaunchError::InstanceBusy.into());
+        }
+        let dir = self.game_dir(id).await?;
+        let path = dir.as_path().to_path_buf();
+        // Folder first: if it can't be removed the instance stays listed and can be retried.
+        tokio::task::spawn_blocking(move || match std::fs::remove_dir_all(path) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e),
+            _ => Ok(()),
+        })
+        .await
+        .map_err(|e| Error::Io(std::io::Error::other(e)))??;
+        sqlx::query("DELETE FROM instances WHERE id = ?1")
+            .bind(id)
+            .execute(&self.db)
+            .await?;
+        Ok(())
+    }
+
+    /// Copy an instance, its settings and its files (not logs, crash reports or natives).
+    pub async fn clone_instance(&self, id: &str, new_name: &str) -> Result<Instance> {
+        let source = self.get(id).await?;
+        let src_dir = self.game_dir(id).await?;
+        let copy = self
+            .create(NewInstance {
+                name: new_name.to_owned(),
+                mc_version: source.mc_version.clone(),
+                loader: source.loader,
+                loader_version: source.loader_version.clone(),
+            })
+            .await?;
+        let dst_dir = self.game_dir(&copy.id).await?;
+        let (from, to) = (
+            src_dir.as_path().to_path_buf(),
+            dst_dir.as_path().to_path_buf(),
+        );
+        let copied = tokio::task::spawn_blocking(move || copy_tree(&from, &to, true))
+            .await
+            .map_err(|e| Error::Io(std::io::Error::other(e)))?;
+        if let Err(e) = copied {
+            let _ = self.delete(&copy.id, false).await;
+            return Err(e.into());
+        }
+        self.update_settings(
+            &copy.id,
+            InstanceSettings {
+                ram_mb: source.ram_mb,
+                jvm_args: source.jvm_args.clone(),
+                java_id: source.java_id.clone(),
+            },
+        )
+        .await
+    }
+
+    pub async fn update_settings(&self, id: &str, s: InstanceSettings) -> Result<Instance> {
+        if s.ram_mb.is_some_and(|mb| !(512..=262_144).contains(&mb)) {
+            return Err(Error::InvalidSetting {
+                key: "ram_mb".into(),
+                reason: "choose between 512 MB and 256 GB".into(),
+            });
+        }
+        let jvm_args = match s
+            .jvm_args
+            .as_deref()
+            .map(str::trim)
+            .filter(|a| !a.is_empty())
+        {
+            Some(a) => {
+                parse_jvm_args(a)?;
+                Some(a.to_owned())
+            }
+            None => None,
+        };
+        if let Some(java_id) = &s.java_id {
+            let known: Option<(i64,)> = sqlx::query_as("SELECT 1 FROM java_runtimes WHERE id = ?1")
+                .bind(java_id)
+                .fetch_optional(&self.db)
+                .await?;
+            if known.is_none() {
+                return Err(Error::InvalidSetting {
+                    key: "java_id".into(),
+                    reason: "that Java runtime isn't known".into(),
+                });
+            }
+        }
+        let done = sqlx::query(
+            "UPDATE instances SET ram_mb = ?2, jvm_args = ?3, java_id = ?4 WHERE id = ?1",
+        )
+        .bind(id)
+        .bind(s.ram_mb.map(i64::from))
+        .bind(jvm_args)
+        .bind(&s.java_id)
+        .execute(&self.db)
+        .await?;
+        if done.rows_affected() == 0 {
+            return Err(LaunchError::InstanceNotFound.into());
+        }
+        self.get(id).await
+    }
+
+    /// Change the Minecraft version and loader (a modpack update can ask for this). The
+    /// loader itself is installed on the next launch. Callers must make sure the instance
+    /// isn't running.
+    pub async fn set_game(
+        &self,
+        id: &str,
+        mc_version: &str,
+        loader: LoaderKind,
+        loader_version: Option<&str>,
+    ) -> Result<()> {
+        if !is_valid_version_id(mc_version) {
+            return Err(LaunchError::InvalidVersionId.into());
+        }
+        let done = sqlx::query(
+            "UPDATE instances SET mc_version = ?2, loader = ?3, loader_version = ?4 WHERE id = ?1",
+        )
+        .bind(id)
+        .bind(mc_version)
+        .bind(loader.as_str())
+        .bind(loader_version)
+        .execute(&self.db)
+        .await?;
+        if done.rows_affected() == 0 {
+            return Err(LaunchError::InstanceNotFound.into());
+        }
+        Ok(())
+    }
+
+    /// Note that the game ran from `started` (unix seconds) for `seconds`.
+    pub async fn record_play(&self, id: &str, started: i64, seconds: i64) -> Result<()> {
+        sqlx::query(
+            "UPDATE instances SET last_played = ?2, playtime_s = playtime_s + ?3 WHERE id = ?1",
+        )
+        .bind(id)
+        .bind(started)
+        .bind(seconds.max(0))
+        .execute(&self.db)
+        .await?;
+        Ok(())
+    }
+}
+
+/// Recursively copy `from` into `to`. Symlinks are skipped: they could point anywhere.
+pub(crate) fn copy_tree(from: &Path, to: &Path, top_level: bool) -> std::io::Result<()> {
+    std::fs::create_dir_all(to)?;
+    for entry in std::fs::read_dir(from)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        if top_level && TRANSIENT.iter().any(|t| std::ffi::OsStr::new(t) == name) {
+            continue;
+        }
+        let kind = entry.file_type()?;
+        if kind.is_dir() {
+            copy_tree(&entry.path(), &to.join(&name), false)?;
+        } else if kind.is_file() {
+            std::fs::copy(entry.path(), to.join(&name))?;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db;
+
+    async fn store() -> (InstanceStore, tempfile::TempDir, Db) {
+        let dir = tempfile::tempdir().unwrap();
+        let db = db::open_in_memory().await.unwrap();
+        (InstanceStore::new(db.clone(), dir.path()), dir, db)
+    }
+
+    fn vanilla(name: &str) -> NewInstance {
+        NewInstance {
+            name: name.into(),
+            mc_version: "1.21.1".into(),
+            loader: LoaderKind::Vanilla,
+            loader_version: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn create_makes_the_folder_layout_and_lists_newest_first() {
+        let (s, dir, _db) = store().await;
+        let a = s.create(vanilla("  My Survival World!  ")).await.unwrap();
+        assert_eq!(a.name, "My Survival World!");
+        let game = s.game_dir(&a.id).await.unwrap();
+        assert!(game
+            .as_path()
+            .starts_with(dir.path().canonicalize().unwrap()));
+        for sub in SUBDIRS {
+            assert!(game.as_path().join(sub).is_dir(), "{sub}");
+        }
+        let folder = game
+            .as_path()
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        assert!(folder.starts_with("my-survival-world-"), "{folder}");
+
+        let fabric = s
+            .create(NewInstance {
+                name: "Mods".into(),
+                mc_version: "1.21.1".into(),
+                loader: LoaderKind::Fabric,
+                loader_version: Some("0.16.5".into()),
+            })
+            .await
+            .unwrap();
+        assert_eq!(fabric.loader, LoaderKind::Fabric);
+        assert_eq!(s.list().await.unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn names_with_nasty_characters_cannot_escape_the_instances_folder() {
+        let (s, dir, _db) = store().await;
+        let i = s.create(vanilla("../../etc/passwd")).await.unwrap();
+        let game = s.game_dir(&i.id).await.unwrap();
+        assert!(game
+            .as_path()
+            .starts_with(dir.path().canonicalize().unwrap()));
+        assert_eq!(
+            i.name, "../../etc/passwd",
+            "the display name is kept as typed"
+        );
+        for bad in ["", "   ", "a\nb", &"x".repeat(65), "tab\there"] {
+            assert!(
+                matches!(
+                    s.create(vanilla(bad)).await,
+                    Err(Error::Launch(LaunchError::InvalidName))
+                ),
+                "{bad:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn loader_and_version_combinations_are_validated() {
+        let (s, _d, _db) = store().await;
+        let mk = |loader, lv: Option<&str>, mc: &str| NewInstance {
+            name: "x".into(),
+            mc_version: mc.into(),
+            loader,
+            loader_version: lv.map(Into::into),
+        };
+        assert!(
+            s.create(mk(LoaderKind::Fabric, None, "1.21.1"))
+                .await
+                .is_err(),
+            "loaders need a version"
+        );
+        assert!(s
+            .create(mk(LoaderKind::Vanilla, Some("1"), "1.21.1"))
+            .await
+            .is_err());
+        assert!(s
+            .create(mk(LoaderKind::Fabric, Some("../x"), "1.21.1"))
+            .await
+            .is_err());
+        assert!(s
+            .create(mk(LoaderKind::Vanilla, None, "../x"))
+            .await
+            .is_err());
+        assert!(
+            s.list().await.unwrap().is_empty(),
+            "rejected instances leave nothing behind"
+        );
+    }
+
+    #[tokio::test]
+    async fn rename_keeps_the_folder_and_missing_ids_are_reported() {
+        let (s, _d, _db) = store().await;
+        let i = s.create(vanilla("Old")).await.unwrap();
+        let before = s.game_dir(&i.id).await.unwrap();
+        let r = s.rename(&i.id, "New").await.unwrap();
+        assert_eq!(r.name, "New");
+        assert_eq!(s.game_dir(&i.id).await.unwrap(), before);
+        assert!(matches!(
+            s.rename("nope", "x").await,
+            Err(Error::Launch(LaunchError::InstanceNotFound))
+        ));
+        assert!(matches!(
+            s.rename(&i.id, "").await,
+            Err(Error::Launch(LaunchError::InvalidName))
+        ));
+    }
+
+    #[tokio::test]
+    async fn delete_removes_files_and_refuses_while_running() {
+        let (s, _d, _db) = store().await;
+        let i = s.create(vanilla("Doomed")).await.unwrap();
+        let game = s.game_dir(&i.id).await.unwrap();
+        std::fs::write(game.as_path().join("saves/world.dat"), b"x").unwrap();
+        assert!(matches!(
+            s.delete(&i.id, true).await,
+            Err(Error::Launch(LaunchError::InstanceBusy))
+        ));
+        assert!(game.as_path().exists());
+        s.delete(&i.id, false).await.unwrap();
+        assert!(!game.as_path().exists());
+        assert!(s.list().await.unwrap().is_empty());
+        assert!(matches!(
+            s.delete(&i.id, false).await,
+            Err(Error::Launch(LaunchError::InstanceNotFound))
+        ));
+    }
+
+    #[tokio::test]
+    async fn deleting_never_follows_a_symlink_out_of_the_instance() {
+        let (s, _d, _db) = store().await;
+        let i = s.create(vanilla("Linked")).await.unwrap();
+        let game = s.game_dir(&i.id).await.unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("precious.txt"), b"keep me").unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(outside.path(), game.as_path().join("saves/escape")).unwrap();
+        s.delete(&i.id, false).await.unwrap();
+        assert!(
+            outside.path().join("precious.txt").exists(),
+            "files behind a symlink must survive"
+        );
+    }
+
+    #[tokio::test]
+    async fn clone_copies_files_and_settings_but_not_transient_folders() {
+        let (s, _d, _db) = store().await;
+        let a = s.create(vanilla("Original")).await.unwrap();
+        let game = s.game_dir(&a.id).await.unwrap();
+        std::fs::write(game.as_path().join("options.txt"), b"fov:90").unwrap();
+        std::fs::write(game.as_path().join("mods/a.jar"), b"jar").unwrap();
+        std::fs::create_dir_all(game.as_path().join("logs")).unwrap();
+        std::fs::write(game.as_path().join("logs/latest.log"), b"log").unwrap();
+        std::fs::create_dir_all(game.as_path().join(".kiln-natives")).unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink("/etc", game.as_path().join("saves/link")).unwrap();
+        s.update_settings(
+            &a.id,
+            InstanceSettings {
+                ram_mb: Some(4096),
+                jvm_args: Some("-XX:+UseG1GC".into()),
+                java_id: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        let b = s.clone_instance(&a.id, "Copy").await.unwrap();
+        assert_ne!(a.id, b.id);
+        assert_eq!(
+            (b.ram_mb, b.jvm_args.as_deref(), b.playtime_s),
+            (Some(4096), Some("-XX:+UseG1GC"), 0)
+        );
+        let copy = s.game_dir(&b.id).await.unwrap();
+        assert_eq!(
+            std::fs::read(copy.as_path().join("options.txt")).unwrap(),
+            b"fov:90"
+        );
+        assert_eq!(
+            std::fs::read(copy.as_path().join("mods/a.jar")).unwrap(),
+            b"jar"
+        );
+        assert!(
+            !copy.as_path().join("logs").exists() && !copy.as_path().join(".kiln-natives").exists()
+        );
+        assert!(
+            !copy.as_path().join("saves/link").exists(),
+            "symlinks are not copied"
+        );
+    }
+
+    #[tokio::test]
+    async fn settings_are_validated() {
+        let (s, _d, db) = store().await;
+        let i = s.create(vanilla("S")).await.unwrap();
+        let set = |ram, args: Option<&str>, java: Option<&str>| InstanceSettings {
+            ram_mb: ram,
+            jvm_args: args.map(Into::into),
+            java_id: java.map(Into::into),
+        };
+        assert!(s
+            .update_settings(&i.id, set(Some(64), None, None))
+            .await
+            .is_err());
+        assert!(s
+            .update_settings(&i.id, set(None, Some("-javaagent:/tmp/evil.jar"), None))
+            .await
+            .is_err());
+        assert!(s
+            .update_settings(&i.id, set(None, None, Some("no-such-runtime")))
+            .await
+            .is_err());
+        let ok = s
+            .update_settings(&i.id, set(Some(2048), Some("  -Xss1M  "), None))
+            .await
+            .unwrap();
+        assert_eq!(
+            (ok.ram_mb, ok.jvm_args.as_deref()),
+            (Some(2048), Some("-Xss1M"))
+        );
+        sqlx::query(
+            "INSERT INTO java_runtimes (id, vendor, major, path) VALUES ('j1','T',21,'/x/java')",
+        )
+        .execute(&db)
+        .await
+        .unwrap();
+        assert_eq!(
+            s.update_settings(&i.id, set(None, Some("   "), Some("j1")))
+                .await
+                .unwrap()
+                .jvm_args,
+            None
+        );
+    }
+
+    #[test]
+    fn jvm_arguments_cannot_load_code_or_run_commands() {
+        assert_eq!(
+            parse_jvm_args("-Xmx4G -Xms1G -XX:+UseG1GC -Dfoo=bar").unwrap(),
+            ["-Xmx4G", "-Xms1G", "-XX:+UseG1GC", "-Dfoo=bar"]
+        );
+        for bad in [
+            "-javaagent:/tmp/x.jar",
+            "-agentlib:jdwp=transport=dt_socket",
+            "-agentpath:/x.so",
+            "-Xbootclasspath/a:/x.jar",
+            "-XX:OnError=rm -rf ~",
+            "-XX:OnOutOfMemoryError=sh",
+            "-XX:VMOptionsFile=/x",
+            "-Djava.library.path=/evil",
+            "-Djava.class.path=/evil",
+            "-cp /evil",
+            "-jar /evil.jar",
+            "--add-opens=a/b=ALL-UNNAMED",
+            "Main",
+            "-Xrunjdwp:x",
+            "-JAVAAGENT:/x",
+            "-Xmx4G\n-javaagent:/x",
+        ] {
+            assert!(parse_jvm_args(bad).is_err(), "accepted {bad:?}");
+        }
+        assert!(
+            parse_jvm_args(&"-Xmx1G ".repeat(400)).is_err(),
+            "length cap"
+        );
+    }
+
+    #[tokio::test]
+    async fn play_time_accumulates() {
+        let (s, _d, _db) = store().await;
+        let i = s.create(vanilla("P")).await.unwrap();
+        s.record_play(&i.id, 1000, 60).await.unwrap();
+        s.record_play(&i.id, 2000, 30).await.unwrap();
+        let g = s.get(&i.id).await.unwrap();
+        assert_eq!((g.last_played, g.playtime_s), (Some(2000), 90));
+    }
+}
+
+<<<<<KILN-END>>>>>
+<<<<<KILN-FILE crates/kiln-core/src/instance/pack.rs>>>>>
+//! Exporting and importing instances: Kiln's own `.kiln.zip` and Modrinth's `.mrpack`.
+//!
+//! Imports treat the pack as hostile: every path goes through `SafePath`, downloads are
+//! limited to the hosts the `.mrpack` format allows and verified against the hashes in the
+//! pack, and nothing in a pack is ever executed: files are only written to disk.
+
+use std::collections::{HashMap, HashSet};
+use std::path::Path;
+
+use serde::{Deserialize, Serialize};
+use tokio::sync::watch;
+
+use super::{
+    validate_name, Instance, InstanceSettings, InstanceStore, NewInstance, SUBDIRS, TRANSIENT,
+};
+use crate::archive::{extract_zip, read_zip_entry, write_zip, write_zip_excluding, ExtractOptions};
+use crate::download::{DownloadTask, Downloader, Progress};
+use crate::hash::{ExpectedHash, HashAlgo};
+use crate::launch::LaunchError;
+use crate::loader::LoaderKind;
+use crate::net::{HostPolicy, HttpClient};
+use crate::paths::{DataDirs, SafePath};
+use crate::{Error, Result, APP_NAME, APP_VERSION};
+
+const NATIVE_MANIFEST: &str = "kiln-instance.json";
+const MRPACK_INDEX: &str = "modrinth.index.json";
+/// Unpacked size cap for packs: worlds can be large, but not unbounded.
+const MAX_UNPACKED: u64 = 32 * 1024 * 1024 * 1024;
+const MAX_FILES: usize = 10_000;
+const MAX_MANIFEST_BYTES: u64 = 8 * 1024 * 1024;
+/// Not exported to `.mrpack`: personal data and machine-generated folders.
+const MRPACK_SKIP: &[&str] = &[
+    "saves",
+    "screenshots",
+    "backups",
+    "logs",
+    "crash-reports",
+    ".kiln-natives",
+];
+
+/// Hosts the `.mrpack` specification allows file downloads from, plus the GitHub CDN that
+/// release downloads redirect to. Hashes are verified, so these can't swap a file.
+pub fn mrpack_policy() -> HostPolicy {
+    HostPolicy::new(&[
+        "cdn.modrinth.com",
+        "github.com",
+        "raw.githubusercontent.com",
+        "gitlab.com",
+        "objects.githubusercontent.com",
+        "release-assets.githubusercontent.com",
+    ])
+}
+
+fn invalid(why: impl Into<String>) -> Error {
+    LaunchError::InvalidPack(why.into()).into()
+}
+
+#[derive(Serialize, Deserialize)]
+struct NativeManifest {
+    format: u32,
+    app: String,
+    name: String,
+    mc_version: String,
+    loader: String,
+    loader_version: Option<String>,
+    ram_mb: Option<u32>,
+}
+
+#[derive(Deserialize)]
+struct Index {
+    #[serde(rename = "formatVersion")]
+    format_version: u32,
+    game: String,
+    name: String,
+    #[serde(default)]
+    files: Vec<IndexFile>,
+    #[serde(default)]
+    dependencies: HashMap<String, String>,
+}
+
+#[derive(Deserialize)]
+struct IndexFile {
+    path: String,
+    #[serde(default)]
+    hashes: HashMap<String, String>,
+    #[serde(default)]
+    env: Option<IndexEnv>,
+    #[serde(default)]
+    downloads: Vec<String>,
+    #[serde(default, rename = "fileSize")]
+    file_size: Option<u64>,
+}
+
+#[derive(Deserialize)]
+struct IndexEnv {
+    #[serde(default)]
+    client: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct ImportFile {
+    pub name: String,
+    pub size: u64,
+}
+
+/// A mod listed in an exported `.mrpack` by hash and URL instead of being bundled.
+#[derive(Debug, Clone)]
+pub struct MrpackFile {
+    /// Path inside the game folder, `/`-separated (`mods/sodium.jar`).
+    pub path: String,
+    pub sha1: String,
+    pub sha512: String,
+    pub size: u64,
+    pub url: String,
+    pub client_env: String,
+    pub server_env: String,
+}
+
+/// User data that a modpack update never touches.
+const UPDATE_PROTECTED_TOP: &[&str] = &["saves", "screenshots", "logs", "crash-reports", "backups"];
+const UPDATE_PROTECTED_FILES: &[&str] = &["options.txt", "servers.dat"];
+
+#[derive(Clone)]
+pub struct PackService {
+    store: InstanceStore,
+    backups: std::path::PathBuf,
+    exports: std::path::PathBuf,
+    imports: std::path::PathBuf,
+    downloader: Downloader,
+    /// Must match the downloader's own policy: it decides which listed URL is used.
+    policy: HostPolicy,
+}
+
+fn loader_dependency_key(kind: LoaderKind) -> Option<&'static str> {
+    match kind {
+        LoaderKind::Vanilla => None,
+        LoaderKind::Fabric => Some("fabric-loader"),
+        LoaderKind::Quilt => Some("quilt-loader"),
+        LoaderKind::Forge => Some("forge"),
+        LoaderKind::Neoforge => Some("neoforge"),
+    }
+}
+
+/// Entry names that must never be written into an instance (Kiln's own scratch folders).
+fn is_reserved(name: &str) -> bool {
+    name.split(['/', '\\']).any(|c| c.starts_with(".kiln"))
+}
+
+impl PackService {
+    pub fn new(store: InstanceStore, dirs: &DataDirs, max_concurrent: u8) -> Result<Self> {
+        let ua = format!("{APP_NAME}/{APP_VERSION}");
+        Ok(Self::with_downloader(
+            store,
+            dirs,
+            Downloader::new(
+                HttpClient::new_for_downloads(&ua, mrpack_policy())?,
+                max_concurrent,
+            ),
+            mrpack_policy(),
+        ))
+    }
+
+    pub(crate) fn with_downloader(
+        store: InstanceStore,
+        dirs: &DataDirs,
+        downloader: Downloader,
+        policy: HostPolicy,
+    ) -> Self {
+        Self {
+            store,
+            backups: dirs.backups.clone(),
+            exports: dirs.exports.clone(),
+            imports: dirs.imports.clone(),
+            downloader,
+            policy,
+        }
+    }
+
+    /// A file name in `exports/` that doesn't exist yet.
+    fn export_target(&self, instance: &Instance, ext: &str) -> Result<SafePath> {
+        let base: String = super::slug(&instance.name);
+        for n in 0..1000 {
+            let name = if n == 0 {
+                format!("{base}.{ext}")
+            } else {
+                format!("{base}-{n}.{ext}")
+            };
+            let target = SafePath::new(&self.exports, &name)?;
+            if !target.as_path().exists() {
+                return Ok(target);
+            }
+        }
+        Err(invalid("too many exports with the same name"))
+    }
+
+    /// Everything in the instance, including worlds, as Kiln's own format. Returns the file
+    /// name inside `exports/`.
+    pub async fn export_native(&self, id: &str) -> Result<String> {
+        let instance = self.store.get(id).await?;
+        let dir = self.store.game_dir(id).await?;
+        let target = self.export_target(&instance, "kiln.zip")?;
+        let manifest = NativeManifest {
+            format: 1,
+            app: APP_NAME.into(),
+            name: instance.name.clone(),
+            mc_version: instance.mc_version.clone(),
+            loader: instance.loader.as_str().into(),
+            loader_version: instance.loader_version.clone(),
+            ram_mb: instance.ram_mb,
+        };
+        let first = vec![(
+            NATIVE_MANIFEST.to_owned(),
+            serde_json::to_vec_pretty(&manifest)?,
+        )];
+        let (dest, src) = (target.as_path().to_path_buf(), dir.as_path().to_path_buf());
+        tokio::task::spawn_blocking(move || write_zip(&dest, "instance/", &src, TRANSIENT, &first))
+            .await
+            .map_err(|e| Error::Io(std::io::Error::other(e)))??;
+        Ok(file_name(&target))
+    }
+
+    /// A Modrinth pack without worlds, with every mod and config bundled as overrides.
+    /// [`export_mrpack_with`](Self::export_mrpack_with) lists known mods by hash instead.
+    pub async fn export_mrpack(&self, id: &str) -> Result<String> {
+        self.export_mrpack_with(id, Vec::new()).await
+    }
+
+    /// A Modrinth pack without worlds. `listed` files are named in the index with their
+    /// hashes and download URLs and left out of `overrides/`; everything else is bundled.
+    pub async fn export_mrpack_with(&self, id: &str, listed: Vec<MrpackFile>) -> Result<String> {
+        let instance = self.store.get(id).await?;
+        let dir = self.store.game_dir(id).await?;
+        let target = self.export_target(&instance, "mrpack")?;
+        let mut dependencies = serde_json::Map::new();
+        dependencies.insert("minecraft".into(), instance.mc_version.clone().into());
+        if let (Some(key), Some(v)) = (
+            loader_dependency_key(instance.loader),
+            &instance.loader_version,
+        ) {
+            dependencies.insert(key.into(), v.clone().into());
+        }
+        let files: Vec<serde_json::Value> = listed
+            .iter()
+            .map(|f| {
+                serde_json::json!({
+                    "path": f.path,
+                    "hashes": { "sha1": f.sha1, "sha512": f.sha512 },
+                    "env": { "client": f.client_env, "server": f.server_env },
+                    "downloads": [f.url],
+                    "fileSize": f.size,
+                })
+            })
+            .collect();
+        let exclude: HashSet<String> = listed.iter().map(|f| f.path.clone()).collect();
+        let index = serde_json::json!({
+            "formatVersion": 1, "game": "minecraft", "versionId": "1.0.0",
+            "name": instance.name, "files": files, "dependencies": dependencies,
+        });
+        let first = vec![(MRPACK_INDEX.to_owned(), serde_json::to_vec_pretty(&index)?)];
+        let (dest, src) = (target.as_path().to_path_buf(), dir.as_path().to_path_buf());
+        tokio::task::spawn_blocking(move || {
+            write_zip_excluding(&dest, "overrides/", &src, MRPACK_SKIP, &first, &exclude)
+        })
+        .await
+        .map_err(|e| Error::Io(std::io::Error::other(e)))??;
+        Ok(file_name(&target))
+    }
+
+    /// Packs waiting in `imports/`.
+    pub fn list_imports(&self) -> Result<Vec<ImportFile>> {
+        let mut out = Vec::new();
+        for entry in std::fs::read_dir(&self.imports)? {
+            let entry = entry?;
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let lower = name.to_ascii_lowercase();
+            if entry.file_type()?.is_file()
+                && (lower.ends_with(".zip") || lower.ends_with(".mrpack"))
+            {
+                out.push(ImportFile {
+                    name,
+                    size: entry.metadata()?.len(),
+                });
+            }
+        }
+        out.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+        Ok(out)
+    }
+
+    /// Import a pack from `imports/` as a new instance.
+    pub async fn import(
+        &self,
+        file_name: &str,
+        progress: Option<watch::Sender<Progress>>,
+    ) -> Result<Instance> {
+        if file_name.contains(['/', '\\']) {
+            return Err(Error::InvalidPath("import file name".into()));
+        }
+        let file = SafePath::new(&self.imports, file_name)?;
+        let path = file.as_path().to_path_buf();
+        if !path.is_file() {
+            return Err(invalid("the file isn't in the imports folder"));
+        }
+        let probe = path.clone();
+        let (has_mrpack, has_native) =
+            tokio::task::spawn_blocking(move || -> Result<(bool, bool)> {
+                let zip = zip::ZipArchive::new(std::fs::File::open(probe)?)?;
+                let names: HashSet<&str> = zip.file_names().collect();
+                Ok((
+                    names.contains(MRPACK_INDEX),
+                    names.contains(NATIVE_MANIFEST),
+                ))
+            })
+            .await
+            .map_err(|e| Error::Io(std::io::Error::other(e)))??;
+        if has_mrpack {
+            self.import_mrpack(&path, progress).await
+        } else if has_native {
+            self.import_native(&path).await
+        } else {
+            Err(invalid("it isn't a Kiln export or a Modrinth pack"))
+        }
+    }
+
+    /// Run `fill` against a fresh instance; if it fails, remove the half-built instance.
+    async fn with_new_instance<F, Fut>(&self, new: NewInstance, fill: F) -> Result<Instance>
+    where
+        F: FnOnce(SafePath) -> Fut,
+        Fut: std::future::Future<Output = Result<()>>,
+    {
+        let instance = self.store.create(new).await?;
+        let dir = self.store.game_dir(&instance.id).await?;
+        match fill(dir).await {
+            Ok(()) => {
+                let dir = self.store.game_dir(&instance.id).await?;
+                for sub in SUBDIRS {
+                    std::fs::create_dir_all(dir.as_path().join(sub))?;
+                }
+                Ok(instance)
+            }
+            Err(e) => {
+                let _ = self.store.delete(&instance.id, false).await;
+                Err(e)
+            }
+        }
+    }
+
+    async fn import_native(&self, path: &Path) -> Result<Instance> {
+        let p = path.to_path_buf();
+        let manifest: NativeManifest = serde_json::from_slice(
+            &tokio::task::spawn_blocking(move || {
+                read_zip_entry(&p, NATIVE_MANIFEST, MAX_MANIFEST_BYTES)
+            })
+            .await
+            .map_err(|e| Error::Io(std::io::Error::other(e)))??,
+        )
+        .map_err(|_| invalid("its manifest is unreadable"))?;
+        if manifest.format != 1 {
+            return Err(invalid("it was made by a newer version of Kiln"));
+        }
+        let loader =
+            LoaderKind::parse(&manifest.loader).ok_or_else(|| invalid("unknown mod loader"))?;
+        let name = validate_name(&manifest.name).map_err(|_| invalid("its name isn't valid"))?;
+        let new = NewInstance {
+            name,
+            mc_version: manifest.mc_version,
+            loader,
+            loader_version: manifest.loader_version,
+        };
+        let archive = path.to_path_buf();
+        let instance = self
+            .with_new_instance(new, |dir| async move {
+                tokio::task::spawn_blocking(move || {
+                    let keep = |n: &str| n.starts_with("instance/") && !is_reserved(n);
+                    extract_zip(
+                        &archive,
+                        dir.as_path(),
+                        &ExtractOptions {
+                            strip_components: 1,
+                            max_total_bytes: MAX_UNPACKED,
+                            filter: Some(&keep),
+                        },
+                    )
+                })
+                .await
+                .map_err(|e| Error::Io(std::io::Error::other(e)))??;
+                Ok(())
+            })
+            .await
+            .map_err(|e| match e {
+                Error::Launch(_) | Error::InvalidPath(_) | Error::Archive(_) => e,
+                other => other,
+            })?;
+        // Java and JVM arguments are machine-specific and untrusted: only RAM is carried over.
+        match manifest.ram_mb {
+            Some(ram_mb) => self
+                .store
+                .update_settings(
+                    &instance.id,
+                    InstanceSettings {
+                        ram_mb: Some(ram_mb),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .or(Ok(instance)),
+            None => Ok(instance),
+        }
+    }
+
+    async fn read_index(&self, path: &Path) -> Result<Index> {
+        let p = path.to_path_buf();
+        let index: Index = serde_json::from_slice(
+            &tokio::task::spawn_blocking(move || {
+                read_zip_entry(&p, MRPACK_INDEX, MAX_MANIFEST_BYTES)
+            })
+            .await
+            .map_err(|e| Error::Io(std::io::Error::other(e)))??,
+        )
+        .map_err(|_| invalid("its index is unreadable"))?;
+        if index.format_version != 1 || index.game != "minecraft" {
+            return Err(invalid(
+                "it isn't a Minecraft pack in a format Kiln understands",
+            ));
+        }
+        if index.files.len() > MAX_FILES {
+            return Err(invalid("it lists too many files"));
+        }
+        Ok(index)
+    }
+
+    async fn import_mrpack(
+        &self,
+        path: &Path,
+        progress: Option<watch::Sender<Progress>>,
+    ) -> Result<Instance> {
+        let index = self.read_index(path).await?;
+        let (mc, loader, loader_version) = pack_game(&index)?;
+        let name: String = index
+            .name
+            .chars()
+            .filter(|c| !c.is_control())
+            .take(64)
+            .collect();
+        let name = if name.trim().is_empty() {
+            "Imported pack".to_owned()
+        } else {
+            name
+        };
+
+        let policy = self.policy.clone();
+        let new = NewInstance {
+            name,
+            mc_version: mc,
+            loader,
+            loader_version,
+        };
+        let archive = path.to_path_buf();
+        let downloader = self.downloader.clone();
+        self.with_new_instance(new, |dir| async move {
+            let tasks = pack_tasks(&index, &dir, &policy)?;
+            downloader
+                .download_all(tasks.into_iter().map(|(_, t)| t).collect(), progress)
+                .await?;
+            for prefix in ["overrides/", "client-overrides/"] {
+                let archive = archive.clone();
+                let dest = dir.as_path().to_path_buf();
+                tokio::task::spawn_blocking(move || {
+                    let keep = |n: &str| n.starts_with(prefix) && !is_reserved(n);
+                    extract_zip(
+                        &archive,
+                        &dest,
+                        &ExtractOptions {
+                            strip_components: 1,
+                            max_total_bytes: MAX_UNPACKED,
+                            filter: Some(&keep),
+                        },
+                    )
+                })
+                .await
+                .map_err(|e| Error::Io(std::io::Error::other(e)))??;
+            }
+            Ok(())
+        })
+        .await
+    }
+
+    /// Move an existing pack instance to a newer version of its pack. `archive_name` is the
+    /// new `.mrpack` in `imports/`; `old_files` are the paths the previous version put in the
+    /// instance. Files that were not put there by the pack are never overwritten or removed,
+    /// and everything the update replaces or removes is first copied to `backups/packs/`.
+    /// Returns the paths this version of the pack owns.
+    pub async fn apply_update(
+        &self,
+        id: &str,
+        archive_name: &str,
+        old_files: &[String],
+        progress: Option<watch::Sender<Progress>>,
+    ) -> Result<Vec<String>> {
+        if archive_name.contains(['/', '\\']) {
+            return Err(Error::InvalidPath("pack file name".into()));
+        }
+        let archive = SafePath::new(&self.imports, archive_name)?
+            .as_path()
+            .to_path_buf();
+        let index = self.read_index(&archive).await?;
+        let (mc, loader, loader_version) = pack_game(&index)?;
+        self.store.get(id).await?;
+        let dir = self.store.game_dir(id).await?;
+        let tasks = pack_tasks(&index, &dir, &self.policy)?;
+
+        let arch = archive.clone();
+        let override_paths = tokio::task::spawn_blocking(move || override_paths(&arch))
+            .await
+            .map_err(|e| Error::Io(std::io::Error::other(e)))??;
+        let mut owned: Vec<String> = tasks.iter().map(|(rel, _)| rel.clone()).collect();
+        owned.extend(override_paths.iter().cloned());
+        owned.sort();
+        owned.dedup();
+        let owned_set: HashSet<&str> = owned.iter().map(String::as_str).collect();
+        let old: HashSet<&str> = old_files.iter().map(String::as_str).collect();
+
+        // 1. Keep a copy of every file the old version put here that still exists.
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs());
+        for rel in old_files {
+            let Ok(src) = SafePath::new(dir.as_path(), rel) else {
+                continue;
+            };
+            if !src.as_path().is_file() {
+                continue;
+            }
+            let dest = SafePath::new(&self.backups, &format!("packs/{id}/{stamp}/{rel}"))?;
+            if let Some(parent) = dest.as_path().parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            std::fs::copy(src.as_path(), dest.as_path())?;
+        }
+        // 2. Download the new files (each is verified before it replaces anything).
+        self.downloader
+            .download_all(tasks.into_iter().map(|(_, t)| t).collect(), progress)
+            .await?;
+        // 3. Remove what the old version had and the new one doesn't.
+        for rel in old_files.iter().filter(|r| !owned_set.contains(r.as_str())) {
+            if let Ok(p) = SafePath::new(dir.as_path(), rel) {
+                match std::fs::remove_file(p.as_path()) {
+                    Ok(()) => {}
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(e) => return Err(e.into()),
+                }
+            }
+        }
+        // 4. Unpack the pack's own files, leaving anything the user added alone.
+        for prefix in ["overrides/", "client-overrides/"] {
+            let archive = archive.clone();
+            let dest = dir.as_path().to_path_buf();
+            let old: HashSet<String> = old.iter().map(|s| (*s).to_owned()).collect();
+            tokio::task::spawn_blocking(move || {
+                let keep = |n: &str| {
+                    let Some(rel) = n.strip_prefix(prefix) else {
+                        return false;
+                    };
+                    if rel.is_empty() || is_reserved(n) || is_user_data(rel) {
+                        return false;
+                    }
+                    old.contains(rel) || !dest.join(rel).exists()
+                };
+                extract_zip(
+                    &archive,
+                    &dest,
+                    &ExtractOptions {
+                        strip_components: 1,
+                        max_total_bytes: MAX_UNPACKED,
+                        filter: Some(&keep),
+                    },
+                )
+            })
+            .await
+            .map_err(|e| Error::Io(std::io::Error::other(e)))??;
+        }
+        // 5. The new pack version may need a different Minecraft version or loader.
+        self.store
+            .set_game(id, &mc, loader, loader_version.as_deref())
+            .await?;
+        Ok(owned)
+    }
+}
+
+fn is_user_data(rel: &str) -> bool {
+    let first = rel.split('/').next().unwrap_or(rel);
+    UPDATE_PROTECTED_TOP.contains(&first) || UPDATE_PROTECTED_FILES.contains(&rel)
+}
+
+/// Minecraft version and loader a pack asks for.
+fn pack_game(index: &Index) -> Result<(String, LoaderKind, Option<String>)> {
+    let mc = index
+        .dependencies
+        .get("minecraft")
+        .cloned()
+        .ok_or_else(|| invalid("it doesn't say which Minecraft version it needs"))?;
+    let mut loader = (LoaderKind::Vanilla, None);
+    for kind in [
+        LoaderKind::Fabric,
+        LoaderKind::Quilt,
+        LoaderKind::Forge,
+        LoaderKind::Neoforge,
+    ] {
+        if let Some(v) = loader_dependency_key(kind).and_then(|k| index.dependencies.get(k)) {
+            if loader.0 != LoaderKind::Vanilla {
+                return Err(invalid("it asks for more than one mod loader"));
+            }
+            loader = (kind, Some(v.clone()));
+        }
+    }
+    Ok((mc, loader.0, loader.1))
+}
+
+/// Download tasks for a pack's listed files, each with its path relative to the game folder.
+/// Every path is validated, every URL must be on the pack host list and every file needs a
+/// checksum.
+fn pack_tasks(
+    index: &Index,
+    dir: &SafePath,
+    policy: &HostPolicy,
+) -> Result<Vec<(String, DownloadTask)>> {
+    let mut tasks = Vec::new();
+    let mut total = 0u64;
+    for f in index
+        .files
+        .iter()
+        .filter(|f| f.env.as_ref().and_then(|e| e.client.as_deref()) != Some("unsupported"))
+    {
+        if is_reserved(&f.path) {
+            return Err(invalid("a file is placed in a folder Kiln reserves"));
+        }
+        let dest = SafePath::new(dir.as_path(), &f.path)
+            .map_err(|_| invalid("a file has an unsafe path"))?;
+        let url = f
+            .downloads
+            .iter()
+            .find(|u| url_allowed(policy, u))
+            .ok_or_else(|| invalid("a file is hosted somewhere Kiln doesn't download from"))?;
+        let hash = match (f.hashes.get("sha512"), f.hashes.get("sha1")) {
+            (Some(h), _) => ExpectedHash::new(HashAlgo::Sha512, h),
+            (None, Some(h)) => ExpectedHash::new(HashAlgo::Sha1, h),
+            _ => return Err(invalid("a file has no checksum")),
+        }
+        .map_err(|_| invalid("a file has an unreadable checksum"))?;
+        total = total.saturating_add(f.file_size.unwrap_or(0));
+        tasks.push((
+            f.path.clone(),
+            DownloadTask {
+                url: url.clone(),
+                dest,
+                hash: Some(hash),
+                size: f.file_size,
+            },
+        ));
+    }
+    if total > MAX_UNPACKED {
+        return Err(invalid("its files are too large"));
+    }
+    Ok(tasks)
+}
+
+/// Files a pack's `overrides/` and `client-overrides/` folders would create.
+fn override_paths(archive: &Path) -> Result<Vec<String>> {
+    let zip = zip::ZipArchive::new(std::fs::File::open(archive)?)?;
+    let mut out = Vec::new();
+    for name in zip.file_names() {
+        for prefix in ["overrides/", "client-overrides/"] {
+            if let Some(rel) = name.strip_prefix(prefix) {
+                if !rel.is_empty() && !rel.ends_with('/') && !is_reserved(name) {
+                    out.push(rel.to_owned());
+                }
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Every game-folder path an `.mrpack` install writes: listed files and override files.
+pub fn mrpack_installed_paths(archive: &Path) -> Result<Vec<String>> {
+    let index: Index =
+        serde_json::from_slice(&read_zip_entry(archive, MRPACK_INDEX, MAX_MANIFEST_BYTES)?)
+            .map_err(|_| invalid("its index is unreadable"))?;
+    let mut out: Vec<String> = index
+        .files
+        .iter()
+        .filter(|f| f.env.as_ref().and_then(|e| e.client.as_deref()) != Some("unsupported"))
+        .map(|f| f.path.clone())
+        .collect();
+    out.extend(override_paths(archive)?);
+    out.sort();
+    out.dedup();
+    Ok(out)
+}
+
+fn url_allowed(policy: &HostPolicy, url: &str) -> bool {
+    reqwest::Url::parse(url).is_ok_and(|u| policy.check(&u).is_ok())
+}
+
+fn file_name(p: &SafePath) -> String {
+    p.as_path()
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::Write;
+    use std::time::Duration;
+
+    use serde_json::json;
+    use wiremock::matchers::path as url_path;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    use super::*;
+    use crate::db;
+    use crate::download::RetryPolicy;
+    use crate::hash::hash_bytes;
+
+    struct Env {
+        svc: PackService,
+        store: InstanceStore,
+        dirs: DataDirs,
+        _tmp: tempfile::TempDir,
+    }
+
+    async fn env(loopback: bool) -> Env {
+        let tmp = tempfile::tempdir().unwrap();
+        let dirs = DataDirs::from_root(tmp.path().join("data"), false);
+        dirs.ensure_created().unwrap();
+        let store = InstanceStore::new(db::open_in_memory().await.unwrap(), &dirs.instances);
+        let policy = if loopback {
+            HostPolicy::new(&[]).with_loopback_http()
+        } else {
+            mrpack_policy()
+        };
+        let dl = Downloader::new(HttpClient::new_for_downloads("t/0", policy).unwrap(), 2)
+            .with_retry(RetryPolicy {
+                attempts: 2,
+                base_delay: Duration::from_millis(1),
+            });
+        Env {
+            svc: PackService::with_downloader(
+                store.clone(),
+                &dirs,
+                dl,
+                if loopback {
+                    HostPolicy::new(&[]).with_loopback_http()
+                } else {
+                    mrpack_policy()
+                },
+            ),
+            store,
+            dirs,
+            _tmp: tmp,
+        }
+    }
+
+    fn zip_of(path: &Path, entries: &[(&str, &[u8])]) {
+        let mut w = zip::ZipWriter::new(std::fs::File::create(path).unwrap());
+        for (n, d) in entries {
+            w.start_file(*n, zip::write::SimpleFileOptions::default())
+                .unwrap();
+            w.write_all(d).unwrap();
+        }
+        w.finish().unwrap();
+    }
+
+    async fn sample(e: &Env) -> Instance {
+        let i = e
+            .store
+            .create(NewInstance {
+                name: "Pack Source".into(),
+                mc_version: "1.21.1".into(),
+                loader: LoaderKind::Fabric,
+                loader_version: Some("0.16.5".into()),
+            })
+            .await
+            .unwrap();
+        let dir = e.store.game_dir(&i.id).await.unwrap();
+        let d = dir.as_path();
+        std::fs::write(d.join("mods/a.jar"), b"jar").unwrap();
+        std::fs::write(d.join("config/x.toml"), b"cfg").unwrap();
+        std::fs::create_dir_all(d.join("saves/World")).unwrap();
+        std::fs::write(d.join("saves/World/level.dat"), b"world").unwrap();
+        std::fs::create_dir_all(d.join("logs")).unwrap();
+        std::fs::write(d.join("logs/latest.log"), b"log").unwrap();
+        e.store
+            .update_settings(
+                &i.id,
+                InstanceSettings {
+                    ram_mb: Some(3072),
+                    jvm_args: Some("-Xss2M".into()),
+                    java_id: None,
+                },
+            )
+            .await
+            .unwrap();
+        i
+    }
+
+    fn move_to_imports(e: &Env, name: &str) -> String {
+        std::fs::rename(e.dirs.exports.join(name), e.dirs.imports.join(name)).unwrap();
+        name.to_owned()
+    }
+
+    #[tokio::test]
+    async fn native_export_and_import_round_trip() {
+        let e = env(true).await;
+        let src = sample(&e).await;
+        let name = e.svc.export_native(&src.id).await.unwrap();
+        assert_eq!(name, "pack-source.kiln.zip");
+        assert_eq!(
+            e.svc.export_native(&src.id).await.unwrap(),
+            "pack-source-1.kiln.zip",
+            "never overwrites an earlier export"
+        );
+
+        let name = move_to_imports(&e, &name);
+        assert_eq!(
+            e.svc.list_imports().unwrap(),
+            [ImportFile {
+                name: name.clone(),
+                size: std::fs::metadata(e.dirs.imports.join(&name)).unwrap().len()
+            }]
+        );
+        let imported = e.svc.import(&name, None).await.unwrap();
+        assert_eq!(
+            (
+                imported.loader,
+                imported.loader_version.as_deref(),
+                imported.mc_version.as_str()
+            ),
+            (LoaderKind::Fabric, Some("0.16.5"), "1.21.1")
+        );
+        assert_eq!(imported.ram_mb, Some(3072));
+        assert_eq!(
+            imported.jvm_args, None,
+            "JVM arguments from a pack are never trusted"
+        );
+        let dir = e.store.game_dir(&imported.id).await.unwrap();
+        assert_eq!(
+            std::fs::read(dir.as_path().join("mods/a.jar")).unwrap(),
+            b"jar"
+        );
+        assert_eq!(
+            std::fs::read(dir.as_path().join("saves/World/level.dat")).unwrap(),
+            b"world",
+            "native export keeps worlds"
+        );
+        assert!(!dir.as_path().join("logs").exists());
+    }
+
+    #[tokio::test]
+    async fn a_hostile_native_pack_is_rejected_and_leaves_nothing_behind() {
+        let e = env(true).await;
+        let manifest = json!({"format": 1, "app": "x", "name": "Evil", "mc_version": "1.21.1", "loader": "vanilla", "loader_version": null, "ram_mb": null}).to_string();
+        for evil in ["instance/../../escape.txt", "instance/.kiln-natives/lib.so"] {
+            let f = e.dirs.imports.join("evil.kiln.zip");
+            zip_of(
+                &f,
+                &[
+                    (NATIVE_MANIFEST, manifest.as_bytes()),
+                    ("instance/mods/ok.jar", b"ok"),
+                    (evil, b"pwned"),
+                ],
+            );
+            let res = e.svc.import("evil.kiln.zip", None).await;
+            if evil.contains("..") {
+                assert!(res.is_err(), "{evil}");
+                assert!(
+                    !e.dirs.root.join("escape.txt").exists()
+                        && !e.dirs.instances.join("../escape.txt").exists()
+                );
+                assert!(
+                    e.store.list().await.unwrap().is_empty(),
+                    "failed import must not leave an instance"
+                );
+            } else {
+                // Reserved folders are skipped silently rather than written.
+                let i = res.unwrap();
+                assert!(!e
+                    .store
+                    .game_dir(&i.id)
+                    .await
+                    .unwrap()
+                    .as_path()
+                    .join(".kiln-natives")
+                    .exists());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn import_only_accepts_plain_file_names_from_the_imports_folder() {
+        let e = env(true).await;
+        std::fs::write(e.dirs.root.join("outside.zip"), b"x").unwrap();
+        for bad in [
+            "../outside.zip",
+            "a/b.zip",
+            "..\\outside.zip",
+            "missing.zip",
+        ] {
+            assert!(e.svc.import(bad, None).await.is_err(), "{bad}");
+        }
+        std::fs::write(e.dirs.imports.join("junk.zip"), b"not a zip").unwrap();
+        assert!(e.svc.import("junk.zip", None).await.is_err());
+        zip_of(
+            &e.dirs.imports.join("neither.zip"),
+            &[("readme.txt", b"hi")],
+        );
+        assert!(matches!(
+            e.svc.import("neither.zip", None).await,
+            Err(Error::Launch(LaunchError::InvalidPack(_)))
+        ));
+    }
+
+    fn mrpack_with(path: &Path, files: serde_json::Value, extra: &[(&str, &[u8])]) {
+        let index =
+            json!({"formatVersion": 1, "game": "minecraft", "versionId": "1", "name": "Cool Pack",
+            "files": files, "dependencies": {"minecraft": "1.20.1", "fabric-loader": "0.15.0"}})
+            .to_string();
+        let mut entries: Vec<(&str, &[u8])> = vec![(MRPACK_INDEX, index.as_bytes())];
+        entries.extend_from_slice(extra);
+        zip_of(path, &entries);
+    }
+
+    #[tokio::test]
+    async fn mrpack_import_downloads_verified_files_and_applies_overrides() {
+        let e = env(true).await;
+        let server = MockServer::start().await;
+        let jar = b"MOD-JAR-BYTES".to_vec();
+        Mock::given(url_path("/data/x.jar"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(jar.clone()))
+            .mount(&server)
+            .await;
+        let files = json!([
+            {"path": "mods/x.jar", "hashes": {"sha1": hash_bytes(HashAlgo::Sha1, &jar), "sha512": hash_bytes(HashAlgo::Sha512, &jar)},
+             "downloads": [format!("{}/data/x.jar", server.uri())], "fileSize": jar.len(), "env": {"client": "required", "server": "required"}},
+            {"path": "mods/server-only.jar", "hashes": {"sha1": hash_bytes(HashAlgo::Sha1, b"s")},
+             "downloads": [format!("{}/data/server-only.jar", server.uri())], "env": {"client": "unsupported", "server": "required"}}
+        ]);
+        mrpack_with(
+            &e.dirs.imports.join("cool.mrpack"),
+            files,
+            &[
+                ("overrides/config/c.toml", b"base"),
+                ("overrides/options.txt", b"fov:70"),
+                ("client-overrides/options.txt", b"fov:90"),
+            ],
+        );
+
+        let i = e.svc.import("cool.mrpack", None).await.unwrap();
+        assert_eq!(
+            (
+                i.name.as_str(),
+                i.loader,
+                i.loader_version.as_deref(),
+                i.mc_version.as_str()
+            ),
+            ("Cool Pack", LoaderKind::Fabric, Some("0.15.0"), "1.20.1")
+        );
+        let dir = e.store.game_dir(&i.id).await.unwrap();
+        assert_eq!(
+            std::fs::read(dir.as_path().join("mods/x.jar")).unwrap(),
+            jar
+        );
+        assert_eq!(
+            std::fs::read(dir.as_path().join("config/c.toml")).unwrap(),
+            b"base"
+        );
+        assert_eq!(
+            std::fs::read(dir.as_path().join("options.txt")).unwrap(),
+            b"fov:90",
+            "client-overrides win"
+        );
+        assert!(!dir.as_path().join("mods/server-only.jar").exists());
+        assert_eq!(
+            server.received_requests().await.unwrap().len(),
+            1,
+            "server-only files are never requested"
+        );
+    }
+
+    #[tokio::test]
+    async fn mrpack_with_a_wrong_hash_or_unsafe_path_is_rejected_cleanly() {
+        let e = env(true).await;
+        let server = MockServer::start().await;
+        Mock::given(url_path("/data/x.jar"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"ACTUAL".to_vec()))
+            .mount(&server)
+            .await;
+        let url = format!("{}/data/x.jar", server.uri());
+        let cases = [
+            json!([{"path": "mods/x.jar", "hashes": {"sha1": hash_bytes(HashAlgo::Sha1, b"DIFFERENT")}, "downloads": [&url], "fileSize": 6}]),
+            json!([{"path": "../../escape.jar", "hashes": {"sha1": hash_bytes(HashAlgo::Sha1, b"ACTUAL")}, "downloads": [&url]}]),
+            json!([{"path": "mods/.kiln-natives/x.so", "hashes": {"sha1": hash_bytes(HashAlgo::Sha1, b"ACTUAL")}, "downloads": [&url]}]),
+            json!([{"path": "mods/x.jar", "hashes": {}, "downloads": [&url]}]),
+        ];
+        for (n, files) in cases.into_iter().enumerate() {
+            mrpack_with(&e.dirs.imports.join("bad.mrpack"), files, &[]);
+            assert!(e.svc.import("bad.mrpack", None).await.is_err(), "case {n}");
+            assert!(
+                e.store.list().await.unwrap().is_empty(),
+                "case {n} left an instance"
+            );
+        }
+        assert!(!e.dirs.root.join("escape.jar").exists());
+    }
+
+    #[tokio::test]
+    async fn mrpack_files_from_unlisted_hosts_are_refused_without_any_request() {
+        let e = env(false).await; // the real allowlist
+        mrpack_with(
+            &e.dirs.imports.join("evil.mrpack"),
+            json!([
+                {"path": "mods/x.jar", "hashes": {"sha1": "a".repeat(40)}, "downloads": ["https://evil.example/x.jar", "http://cdn.modrinth.com/plain-http.jar"]}
+            ]),
+            &[],
+        );
+        let err = e.svc.import("evil.mrpack", None).await.unwrap_err();
+        assert!(
+            matches!(&err, Error::Launch(LaunchError::InvalidPack(m)) if m.contains("hosted")),
+            "{err:?}"
+        );
+        assert!(e.store.list().await.unwrap().is_empty());
+
+        let p = mrpack_policy();
+        assert!(url_allowed(&p, "https://cdn.modrinth.com/data/a/b.jar"));
+        assert!(url_allowed(&p, "https://raw.githubusercontent.com/a/b/c"));
+        assert!(!url_allowed(&p, "https://cdn.modrinth.com.evil.net/x"));
+        assert!(!url_allowed(&p, "http://cdn.modrinth.com/x"));
+    }
+
+    #[tokio::test]
+    async fn mrpack_dependency_rules() {
+        let e = env(true).await;
+        let write = |deps: serde_json::Value, game: &str| {
+            let index = json!({"formatVersion": 1, "game": game, "name": "N", "files": [], "dependencies": deps}).to_string();
+            zip_of(
+                &e.dirs.imports.join("d.mrpack"),
+                &[(MRPACK_INDEX, index.as_bytes())],
+            );
+        };
+        write(
+            json!({"minecraft": "1.20.1", "fabric-loader": "1", "forge": "2"}),
+            "minecraft",
+        );
+        assert!(e.svc.import("d.mrpack", None).await.is_err(), "two loaders");
+        write(json!({"fabric-loader": "1"}), "minecraft");
+        assert!(
+            e.svc.import("d.mrpack", None).await.is_err(),
+            "no Minecraft version"
+        );
+        write(json!({"minecraft": "1.20.1"}), "terraria");
+        assert!(e.svc.import("d.mrpack", None).await.is_err(), "wrong game");
+        write(json!({"minecraft": "1.20.1"}), "minecraft");
+        assert_eq!(
+            e.svc.import("d.mrpack", None).await.unwrap().loader,
+            LoaderKind::Vanilla
+        );
+    }
+
+    #[tokio::test]
+    async fn mrpack_export_leaves_out_worlds_and_re_imports() {
+        let e = env(true).await;
+        let src = sample(&e).await;
+        let name = e.svc.export_mrpack(&src.id).await.unwrap();
+        assert_eq!(name, "pack-source.mrpack");
+        let zip =
+            zip::ZipArchive::new(std::fs::File::open(e.dirs.exports.join(&name)).unwrap()).unwrap();
+        let names: Vec<&str> = zip.file_names().collect();
+        assert!(
+            names.contains(&MRPACK_INDEX)
+                && names.contains(&"overrides/mods/a.jar")
+                && names.contains(&"overrides/config/x.toml")
+        );
+        assert!(
+            !names
+                .iter()
+                .any(|n| n.contains("saves") || n.contains("logs")),
+            "{names:?}"
+        );
+
+        move_to_imports(&e, &name);
+        let i = e.svc.import(&name, None).await.unwrap();
+        assert_eq!(
+            (i.loader, i.loader_version.as_deref()),
+            (LoaderKind::Fabric, Some("0.16.5"))
+        );
+        let dir = e.store.game_dir(&i.id).await.unwrap();
+        assert_eq!(
+            std::fs::read(dir.as_path().join("mods/a.jar")).unwrap(),
+            b"jar"
+        );
+        assert!(!dir.as_path().join("saves/World").exists());
+    }
+}
+
+<<<<<KILN-END>>>>>
+<<<<<KILN-FILE crates/kiln-core/src/launch/args.rs>>>>>
+//! Builds the JVM and game command line from a version's argument templates.
+
+use crate::mojang::rules::Environment;
+use crate::mojang::VersionJson;
+
+/// Values substituted into `${placeholders}`.
+pub struct ArgContext<'a> {
+    pub player_name: &'a str,
+    /// 32 hex characters, no dashes.
+    pub uuid: &'a str,
+    pub access_token: &'a str,
+    pub version_name: &'a str,
+    pub version_type: &'a str,
+    pub game_dir: &'a str,
+    pub assets_root: &'a str,
+    pub assets_index: &'a str,
+    pub natives_dir: &'a str,
+    pub classpath: &'a str,
+    pub library_dir: &'a str,
+    pub launcher_name: &'a str,
+    pub launcher_version: &'a str,
+}
+
+fn classpath_separator() -> &'static str {
+    if cfg!(windows) {
+        ";"
+    } else {
+        ":"
+    }
+}
+
+pub fn join_classpath<'a>(entries: impl IntoIterator<Item = &'a str>) -> String {
+    entries
+        .into_iter()
+        .collect::<Vec<_>>()
+        .join(classpath_separator())
+}
+
+/// `None` means "we have no value": the argument is dropped instead of passed empty.
+fn lookup(key: &str, c: &ArgContext<'_>) -> Option<String> {
+    Some(match key {
+        "auth_player_name" => c.player_name.into(),
+        "auth_uuid" => c.uuid.into(),
+        "auth_access_token" => c.access_token.into(),
+        "auth_session" => format!("token:{}:{}", c.access_token, c.uuid),
+        "user_type" => "msa".into(),
+        "user_properties" => "{}".into(),
+        "version_name" => c.version_name.into(),
+        "version_type" => c.version_type.into(),
+        "game_directory" => c.game_dir.into(),
+        "assets_root" | "game_assets" => c.assets_root.into(),
+        "assets_index_name" => c.assets_index.into(),
+        "natives_directory" => c.natives_dir.into(),
+        "classpath" => c.classpath.into(),
+        "library_directory" => c.library_dir.into(),
+        "classpath_separator" => classpath_separator().into(),
+        "launcher_name" => c.launcher_name.into(),
+        "launcher_version" => c.launcher_version.into(),
+        // `clientid`, `auth_xuid` (telemetry ids), resolution, quick play: not provided.
+        _ => return None,
+    })
+}
+
+fn expand(token: &str, c: &ArgContext<'_>) -> Option<String> {
+    let mut out = String::new();
+    let mut rest = token;
+    while let Some(start) = rest.find("${") {
+        out.push_str(&rest[..start]);
+        let after = &rest[start + 2..];
+        let Some(end) = after.find('}') else {
+            out.push_str(&rest[start..]);
+            return Some(out);
+        };
+        out.push_str(&lookup(&after[..end], c)?);
+        rest = &after[end + 1..];
+    }
+    out.push_str(rest);
+    Some(out)
+}
+
+fn expand_all<'a>(tokens: impl IntoIterator<Item = &'a str>, c: &ArgContext<'_>) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for token in tokens {
+        match expand(token, c) {
+            Some(value) => out.push(value),
+            // A flag whose value we can't provide goes too: `--xuid ${auth_xuid}`.
+            None => {
+                if out.last().is_some_and(|l| l.starts_with("--")) {
+                    out.pop();
+                }
+            }
+        }
+    }
+    out
+}
+
+/// The complete argument list for `java`: JVM flags, main class, then game flags.
+pub fn build_args(
+    version: &VersionJson,
+    env: &Environment,
+    ctx: &ArgContext<'_>,
+    ram_mb: Option<u32>,
+    extra_jvm: &[String],
+) -> Vec<String> {
+    let (jvm, game): (Vec<&str>, Vec<&str>) =
+        match (&version.arguments, &version.minecraft_arguments) {
+            (Some(a), _) => (
+                a.jvm.iter().flat_map(|x| x.values(env)).collect(),
+                a.game.iter().flat_map(|x| x.values(env)).collect(),
+            ),
+            // Before 1.13 the JSON has no JVM arguments at all.
+            (None, Some(legacy)) => (
+                vec![
+                    "-Djava.library.path=${natives_directory}",
+                    "-cp",
+                    "${classpath}",
+                ],
+                legacy.split_whitespace().collect(),
+            ),
+            (None, None) => (Vec::new(), Vec::new()),
+        };
+    let mut args = Vec::new();
+    if let Some(mb) = ram_mb {
+        args.push(format!("-Xmx{mb}M"));
+    }
+    args.extend(extra_jvm.iter().cloned());
+    args.extend(expand_all(jvm, ctx));
+    args.push(version.main_class.clone());
+    args.extend(expand_all(game, ctx));
+    args
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::*;
+
+    fn ctx() -> ArgContext<'static> {
+        ArgContext {
+            player_name: "Steve",
+            uuid: "069a79f44e9d4e9cb12bd4a2bb7d6fd4",
+            access_token: "TOKEN",
+            version_name: "1.21.1",
+            version_type: "release",
+            game_dir: "/g",
+            assets_root: "/a",
+            assets_index: "17",
+            natives_dir: "/n",
+            classpath: "/c.jar",
+            library_dir: "/l",
+            launcher_name: "Kiln",
+            launcher_version: "0.1",
+        }
+    }
+
+    fn version(extra: serde_json::Value) -> VersionJson {
+        let mut v = json!({
+            "id": "1.21.1", "type": "release", "mainClass": "net.minecraft.client.main.Main",
+            "assetIndex": {"id": "17", "sha1": "a".repeat(40), "size": 1, "url": "https://x/i"},
+        });
+        v.as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        serde_json::from_value(v).unwrap()
+    }
+
+    #[test]
+    fn modern_arguments_expand_and_optional_flags_are_dropped() {
+        let v = version(json!({"arguments": {
+            "jvm": ["-Djava.library.path=${natives_directory}", "-cp", "${classpath}"],
+            "game": ["--username", "${auth_player_name}", "--clientId", "${clientid}",
+                     "--xuid", "${auth_xuid}", "--accessToken", "${auth_access_token}",
+                     "--gameDir", "${game_directory}"]
+        }}));
+        let env = Environment::current();
+        let args = build_args(&v, &env, &ctx(), Some(3072), &["-Xss1M".to_string()]);
+        assert_eq!(
+            args,
+            [
+                "-Xmx3072M",
+                "-Xss1M",
+                "-Djava.library.path=/n",
+                "-cp",
+                "/c.jar",
+                "net.minecraft.client.main.Main",
+                "--username",
+                "Steve",
+                "--accessToken",
+                "TOKEN",
+                "--gameDir",
+                "/g",
+            ]
+        );
+    }
+
+    #[test]
+    fn legacy_argument_strings_get_default_jvm_flags() {
+        let v = version(json!({
+            "minecraftArguments": "--username ${auth_player_name} --session ${auth_session} --userProperties ${user_properties} --assetsDir ${game_assets}"
+        }));
+        let args = build_args(&v, &Environment::current(), &ctx(), None, &[]);
+        assert_eq!(&args[..3], ["-Djava.library.path=/n", "-cp", "/c.jar"]);
+        assert!(args.contains(&"token:TOKEN:069a79f44e9d4e9cb12bd4a2bb7d6fd4".to_string()));
+        assert!(args.contains(&"{}".to_string()));
+        assert!(args.contains(&"/a".to_string()));
+    }
+
+    #[test]
+    fn unknown_placeholders_never_reach_the_command_line_verbatim() {
+        let v = version(
+            json!({"arguments": {"jvm": [], "game": ["--mystery", "${nope}", "--keep", "yes"]}}),
+        );
+        let args = build_args(&v, &Environment::current(), &ctx(), None, &[]);
+        assert!(!args.iter().any(|a| a.contains("${")), "{args:?}");
+        assert!(args.windows(2).any(|w| w == ["--keep", "yes"]));
+        assert!(!args.contains(&"--mystery".to_string()));
+    }
+
+    #[test]
+    fn placeholders_embedded_in_a_token_and_unterminated_ones() {
+        let c = ctx();
+        assert_eq!(
+            expand("-Dx=${version_name}-${version_type}", &c).as_deref(),
+            Some("-Dx=1.21.1-release")
+        );
+        assert_eq!(
+            expand("odd${unterminated", &c).as_deref(),
+            Some("odd${unterminated")
+        );
+        assert_eq!(expand("a${nope}b", &c), None);
+    }
+
+    #[test]
+    fn classpath_joins_with_the_platform_separator() {
+        let sep = if cfg!(windows) { ";" } else { ":" };
+        assert_eq!(join_classpath(["a", "b"]), format!("a{sep}b"));
+    }
+}
+
+<<<<<KILN-END>>>>>
+<<<<<KILN-FILE crates/kiln-core/src/launch/error.rs>>>>>
+//! Errors from resolving versions, installing Java and starting the game.
+
+#[derive(Debug, thiserror::Error)]
+pub enum LaunchError {
+    #[error("invalid version id")]
+    InvalidVersionId,
+    #[error("unknown Minecraft version {0}")]
+    UnknownVersion(String),
+    #[error("library {0} has no download information")]
+    UnsupportedLibrary(String),
+    #[error("version {0} uses the legacy asset layout")]
+    LegacyAssets(String),
+    #[error("no Java {0} build is available for this computer")]
+    NoJavaBuild(u32),
+    #[error("the Java runtime is not usable: {0}")]
+    BadJava(String),
+    #[error("a game is already running")]
+    AlreadyRunning,
+    #[error("no game is running")]
+    NotRunning,
+    #[error("no account is signed in")]
+    NoAccount,
+    #[error("the game could not be started: {0}")]
+    SpawnFailed(String),
+    #[error("no such instance")]
+    InstanceNotFound,
+    #[error("invalid instance name")]
+    InvalidName,
+    #[error("the instance is in use")]
+    InstanceBusy,
+    #[error("invalid JVM arguments: {0}")]
+    InvalidJvmArgs(String),
+    #[error("not a usable pack: {0}")]
+    InvalidPack(String),
+    #[error("installing the mod loader failed: {0}")]
+    LoaderInstall(String),
+    #[error("{0} is not compatible with Minecraft {1}")]
+    IncompatibleLoader(String, String),
+}
+
+impl LaunchError {
+    pub fn code(&self) -> &'static str {
+        match self {
+            Self::InvalidVersionId => "invalid_version",
+            Self::UnknownVersion(_) => "unknown_version",
+            Self::UnsupportedLibrary(_) => "unsupported_library",
+            Self::LegacyAssets(_) => "legacy_assets",
+            Self::NoJavaBuild(_) => "no_java_build",
+            Self::BadJava(_) => "bad_java",
+            Self::AlreadyRunning => "already_running",
+            Self::NotRunning => "not_running",
+            Self::NoAccount => "no_account",
+            Self::SpawnFailed(_) => "spawn_failed",
+            Self::InstanceNotFound => "instance_not_found",
+            Self::InvalidName => "invalid_name",
+            Self::InstanceBusy => "instance_busy",
+            Self::InvalidJvmArgs(_) => "invalid_jvm_args",
+            Self::InvalidPack(_) => "invalid_pack",
+            Self::LoaderInstall(_) => "loader_install_failed",
+            Self::IncompatibleLoader(..) => "incompatible_loader",
+        }
+    }
+
+    pub fn user_message(&self) -> String {
+        match self {
+            Self::InvalidVersionId => "That isn't a valid Minecraft version.".into(),
+            Self::UnknownVersion(v) => format!("Mojang has no Minecraft version called \"{v}\"."),
+            Self::UnsupportedLibrary(_) => {
+                "This version needs a library Kiln can't download yet.".into()
+            }
+            Self::LegacyAssets(_) => {
+                "This is a very old version that stores its assets in a legacy \
+                layout, which Kiln doesn't support yet."
+                    .into()
+            }
+            Self::NoJavaBuild(n) => format!(
+                "Kiln couldn't find a Java {n} runtime to download for this computer. Install \
+                 Java {n} yourself and Kiln will use it."
+            ),
+            Self::BadJava(_) => "The Java runtime Kiln found doesn't work. Reinstall Java, or \
+                delete Kiln's java folder so it downloads a fresh copy."
+                .into(),
+            Self::AlreadyRunning => {
+                "A game is already running. Close it before starting another.".into()
+            }
+            Self::NotRunning => "No game is running.".into(),
+            Self::NoAccount => {
+                "Sign in with a Microsoft account on the Accounts page first.".into()
+            }
+            Self::InstanceNotFound => "That instance no longer exists.".into(),
+            Self::InvalidName => {
+                "Instance names must be 1 to 64 characters with no control characters.".into()
+            }
+            Self::InstanceBusy => "That instance is running. Close the game first.".into(),
+            Self::InvalidJvmArgs(why) => format!("Those Java arguments aren't allowed: {why}."),
+            Self::InvalidPack(why) => format!("Kiln can't use that pack: {why}."),
+            Self::LoaderInstall(_) => {
+                "Kiln couldn't install the mod loader. Check your connection \
+                and try again; if it keeps failing, the log has details."
+                    .into()
+            }
+            Self::IncompatibleLoader(loader, mc) => {
+                format!("{loader} isn't available for Minecraft {mc}.")
+            }
+            Self::SpawnFailed(_) => "Kiln couldn't start the game process. Check that Java is \
+                installed correctly and that your antivirus isn't blocking it."
+                .into(),
+        }
+    }
+}
+
+<<<<<KILN-END>>>>>
+<<<<<KILN-FILE crates/kiln-core/src/launch/manager.rs>>>>>
+use std::collections::VecDeque;
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::Duration;
+
+use serde::Serialize;
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, BufReader};
+use tokio::sync::{watch, Notify};
+
+use super::args::{build_args, join_classpath, ArgContext};
+use super::LaunchError;
+use crate::archive::{extract_zip, ExtractOptions};
+use crate::auth::LaunchSession;
+use crate::download::Progress;
+use crate::instance::InstanceStore;
+use crate::java::JavaManager;
+use crate::loader::{InstallContext, LoaderClient, LoaderKind};
+use crate::mods::store::{ModStore, RollbackReport};
+use crate::mojang::rules::Environment;
+use crate::mojang::{is_valid_version_id, MojangClient};
+use crate::paths::{DataDirs, SafePath};
+use crate::{redact, AppError, Result, APP_NAME, APP_VERSION};
+
+/// Game output lines kept for a console opened after the game started.
+const LOG_BUFFER_LINES: usize = 2000;
+/// Longest piece of output forwarded as a single line.
+const MAX_LINE_BYTES: u64 = 64 * 1024;
+const MAX_LINE_CHARS: usize = 8 * 1024;
+/// Natives are a few MB; anything bigger is not a natives bundle.
+const MAX_NATIVES_BYTES: u64 = 256 * 1024 * 1024;
+
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum LogStream {
+    Stdout,
+    Stderr,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct LogLine {
+    pub stream: LogStream,
+    pub text: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize, PartialEq)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum LaunchStatus {
+    #[default]
+    Idle,
+    Preparing {
+        stage: String,
+        progress: Option<Progress>,
+    },
+    Running {
+        pid: u32,
+    },
+    Exited {
+        code: Option<i32>,
+    },
+    Failed {
+        code: String,
+        message: String,
+    },
+}
+
+impl LaunchStatus {
+    fn preparing(stage: &str) -> Self {
+        Self::Preparing {
+            stage: stage.into(),
+            progress: None,
+        }
+    }
+
+    fn is_active(&self) -> bool {
+        matches!(self, Self::Preparing { .. } | Self::Running { .. })
+    }
+}
+
+/// Where status changes and game output go. The Tauri shell turns these into UI events.
+pub trait LaunchEvents: Send + Sync + 'static {
+    fn status(&self, status: &LaunchStatus);
+    fn log(&self, line: &LogLine);
+    /// Mod updates were undone because the game failed to start after them.
+    fn rolled_back(&self, _report: &RollbackReport) {}
+}
+
+pub struct LaunchRequest {
+    pub mc_version: String,
+    pub loader: LoaderKind,
+    pub loader_version: Option<String>,
+    /// The game's folder inside `instances/`.
+    pub game_dir: SafePath,
+    /// Set when launching a stored instance, so play time can be recorded.
+    pub instance_id: Option<String>,
+    pub ram_mb: Option<u32>,
+    /// Extra JVM flags. Must already have passed `instance::parse_jvm_args`.
+    pub jvm_args: Vec<String>,
+    /// Use this `java` instead of finding or downloading one.
+    pub java_path: Option<PathBuf>,
+}
+
+pub struct LaunchDeps {
+    pub dirs: DataDirs,
+    pub mojang: MojangClient,
+    pub java: JavaManager,
+    pub loaders: LoaderClient,
+    pub instances: Option<InstanceStore>,
+    /// When set, a mod update that stops the game from starting is undone automatically.
+    pub mods: Option<ModStore>,
+}
+
+/// Everything needed to start the process. `Debug` hides the arguments: they hold the
+/// access token.
+pub struct Prepared {
+    pub java: PathBuf,
+    pub args: Vec<String>,
+    pub game_dir: PathBuf,
+}
+
+impl std::fmt::Debug for Prepared {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Prepared { .. }")
+    }
+}
+
+/// Turns download progress into throttled status events until dropped.
+struct Forwarder {
+    tx: watch::Sender<Progress>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for Forwarder {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+fn forwarder(events: &Arc<dyn LaunchEvents>, stage: &'static str) -> Forwarder {
+    let (tx, mut rx) = watch::channel(Progress::default());
+    let events = Arc::clone(events);
+    let task = tokio::spawn(async move {
+        while rx.changed().await.is_ok() {
+            let progress = *rx.borrow_and_update();
+            events.status(&LaunchStatus::Preparing {
+                stage: stage.into(),
+                progress: Some(progress),
+            });
+            // Updates arriving meanwhile coalesce into the latest one.
+            tokio::time::sleep(Duration::from_millis(120)).await;
+        }
+    });
+    Forwarder { tx, task }
+}
+
+fn path_str(p: &std::path::Path) -> String {
+    p.to_string_lossy().into_owned()
+}
+
+/// Download everything the version needs, install Java, unpack natives and build the command.
+pub async fn prepare(
+    deps: &LaunchDeps,
+    req: &LaunchRequest,
+    session: &LaunchSession,
+    events: &Arc<dyn LaunchEvents>,
+) -> Result<Prepared> {
+    let id = req.mc_version.as_str();
+    if !is_valid_version_id(id) {
+        return Err(LaunchError::InvalidVersionId.into());
+    }
+    events.status(&LaunchStatus::preparing("Fetching version information"));
+    let parent = deps.mojang.version_json(id).await?;
+    if parent.inherits_from.is_some() {
+        return Err(LaunchError::UnsupportedLibrary(format!("{id} (loader profile)")).into());
+    }
+    let env = Environment::current();
+    let parent_libs = parent.resolve_libraries(&env)?;
+    let index = deps.mojang.asset_index(&parent).await?;
+
+    // Step 1: everything vanilla needs.
+    let client_task = deps.mojang.client_jar_task(&parent)?;
+    let client_jar = client_task.dest.as_path().to_path_buf();
+    let mut tasks = vec![client_task];
+    for lib in parent_libs
+        .classpath
+        .iter()
+        .chain(parent_libs.natives.iter().map(|(l, _)| l))
+    {
+        tasks.push(deps.mojang.library_task(lib)?);
+    }
+    tasks.extend(deps.mojang.asset_tasks(&index)?);
+    events.status(&LaunchStatus::preparing("Downloading game files"));
+    {
+        let fwd = forwarder(events, "Downloading game files");
+        deps.mojang
+            .downloader()
+            .download_all(tasks, Some(fwd.tx.clone()))
+            .await?;
+    }
+
+    // Step 2: Java (the Forge installer needs it too).
+    let java = match &req.java_path {
+        Some(p) => p.clone(),
+        None => {
+            events.status(&LaunchStatus::preparing("Preparing Java"));
+            let fwd = forwarder(events, "Downloading Java");
+            deps.java
+                .ensure(parent.java_major(), Some(fwd.tx.clone()))
+                .await?
+        }
+    };
+
+    // Step 3: the mod loader, merged onto the vanilla version.
+    let (version, libs) = if req.loader == LoaderKind::Vanilla {
+        (parent, parent_libs)
+    } else {
+        let lv = req
+            .loader_version
+            .as_deref()
+            .ok_or(LaunchError::InvalidVersionId)?;
+        events.status(&LaunchStatus::preparing(&format!(
+            "Installing {} (the first time can take a few minutes)",
+            req.loader.display_name()
+        )));
+        let profile = deps
+            .loaders
+            .ensure_installed(
+                req.loader,
+                id,
+                lv,
+                &InstallContext {
+                    java: &java,
+                    client_jar: &client_jar,
+                },
+            )
+            .await?;
+        let merged = profile.merged_onto(&parent);
+        let libs = merged.resolve_libraries(&env)?;
+        let already: std::collections::HashSet<&str> = parent_libs
+            .classpath
+            .iter()
+            .chain(parent_libs.natives.iter().map(|(l, _)| l))
+            .map(|l| l.path.as_str())
+            .collect();
+        let mut tasks = Vec::new();
+        for lib in libs
+            .classpath
+            .iter()
+            .chain(libs.natives.iter().map(|(l, _)| l))
+        {
+            if already.contains(lib.path.as_str()) {
+                continue;
+            }
+            if lib.url.is_empty() {
+                // Produced by the loader's installer: it must exist already.
+                if !deps.mojang.library_path(lib)?.as_path().is_file() {
+                    return Err(LaunchError::UnsupportedLibrary(lib.path.clone()).into());
+                }
+            } else {
+                tasks.push(deps.mojang.library_task(lib)?);
+            }
+        }
+        events.status(&LaunchStatus::preparing("Downloading loader files"));
+        let fwd = forwarder(events, "Downloading loader files");
+        deps.loaders
+            .downloader()
+            .download_all(tasks, Some(fwd.tx.clone()))
+            .await?;
+        (merged, libs)
+    };
+
+    events.status(&LaunchStatus::preparing("Starting the game"));
+    let game_root = req.game_dir.clone();
+    std::fs::create_dir_all(game_root.as_path())?;
+    let natives = SafePath::new(game_root.as_path(), ".kiln-natives")?;
+    let natives_dir = natives.as_path().to_path_buf();
+    let native_jars: Vec<(PathBuf, Vec<String>)> = libs
+        .natives
+        .iter()
+        .map(|(l, exclude)| {
+            Ok((
+                deps.mojang.library_path(l)?.as_path().to_path_buf(),
+                exclude.clone(),
+            ))
+        })
+        .collect::<Result<_>>()?;
+    {
+        let natives_dir = natives_dir.clone();
+        tokio::task::spawn_blocking(move || -> Result<()> {
+            let _ = std::fs::remove_dir_all(&natives_dir);
+            std::fs::create_dir_all(&natives_dir)?;
+            for (jar, exclude) in native_jars {
+                let keep = |name: &str| {
+                    !name.starts_with("META-INF/")
+                        && !exclude.iter().any(|e| name.starts_with(e.as_str()))
+                };
+                let opts = ExtractOptions {
+                    max_total_bytes: MAX_NATIVES_BYTES,
+                    filter: Some(&keep),
+                    ..Default::default()
+                };
+                extract_zip(&jar, &natives_dir, &opts)?;
+            }
+            Ok(())
+        })
+        .await
+        .map_err(|e| crate::Error::Io(std::io::Error::other(e)))??;
+    }
+
+    let mut classpath = Vec::new();
+    for lib in &libs.classpath {
+        classpath.push(path_str(deps.mojang.library_path(lib)?.as_path()));
+    }
+    classpath.push(path_str(&client_jar));
+    let classpath = join_classpath(classpath.iter().map(String::as_str));
+    let assets_root = path_str(&deps.mojang.assets_root()?);
+    let library_dir = path_str(&deps.mojang.cache_dir("libraries")?);
+    let ctx = ArgContext {
+        player_name: &session.username,
+        uuid: &session.account_id,
+        access_token: session.access_token.expose(),
+        version_name: &version.id,
+        version_type: &version.kind,
+        game_dir: &path_str(game_root.as_path()),
+        assets_root: &assets_root,
+        assets_index: &version.asset_index_ref()?.id,
+        natives_dir: &path_str(&natives_dir),
+        classpath: &classpath,
+        library_dir: &library_dir,
+        launcher_name: APP_NAME,
+        launcher_version: APP_VERSION,
+    };
+    let args = build_args(&version, &env, &ctx, req.ram_mb, &req.jvm_args);
+    Ok(Prepared {
+        java,
+        args,
+        game_dir: game_root.as_path().to_path_buf(),
+    })
+}
+
+/// Forward a child's output line by line, with secrets masked. Invalid UTF-8 is replaced
+/// rather than ending the stream, and overlong lines are split.
+async fn pump(reader: impl AsyncRead + Unpin, stream: LogStream, events: &dyn LaunchEvents) {
+    let mut reader = BufReader::new(reader);
+    let mut buf = Vec::new();
+    loop {
+        buf.clear();
+        match (&mut reader)
+            .take(MAX_LINE_BYTES)
+            .read_until(b'\n', &mut buf)
+            .await
+        {
+            Ok(0) | Err(_) => break,
+            Ok(_) => {
+                let text = String::from_utf8_lossy(&buf);
+                let text: String = text
+                    .trim_end_matches(['\n', '\r'])
+                    .chars()
+                    .take(MAX_LINE_CHARS)
+                    .collect();
+                events.log(&LogLine {
+                    stream,
+                    text: redact::global().redact(&text).into_owned(),
+                });
+            }
+        }
+    }
+}
+
+/// Run the game and wait for it to exit. Dropping this future kills the process.
+pub async fn spawn_and_stream(
+    prepared: Prepared,
+    events: &Arc<dyn LaunchEvents>,
+) -> Result<Option<i32>> {
+    let mut cmd = tokio::process::Command::new(&prepared.java);
+    cmd.args(&prepared.args)
+        .current_dir(&prepared.game_dir)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true);
+    super::hide_console_window(&mut cmd);
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| LaunchError::SpawnFailed(e.kind().to_string()))?;
+    let (Some(stdout), Some(stderr)) = (child.stdout.take(), child.stderr.take()) else {
+        return Err(LaunchError::SpawnFailed("no output pipes".into()).into());
+    };
+    events.status(&LaunchStatus::Running {
+        pid: child.id().unwrap_or(0),
+    });
+    let (_, _, exit) = tokio::join!(
+        pump(stdout, LogStream::Stdout, events.as_ref()),
+        pump(stderr, LogStream::Stderr, events.as_ref()),
+        child.wait()
+    );
+    Ok(exit?.code())
+}
+
+#[derive(Default)]
+struct Shared {
+    status: LaunchStatus,
+    log: VecDeque<LogLine>,
+    stop: Option<Arc<Notify>>,
+    instance: Option<String>,
+    run_started: Option<std::time::Instant>,
+}
+
+fn lock(m: &Mutex<Shared>) -> MutexGuard<'_, Shared> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Remembers the latest status and recent output, then passes events on.
+struct Tee {
+    shared: Arc<Mutex<Shared>>,
+    out: Arc<dyn LaunchEvents>,
+}
+
+impl LaunchEvents for Tee {
+    fn status(&self, status: &LaunchStatus) {
+        {
+            let mut s = lock(&self.shared);
+            if matches!(status, LaunchStatus::Running { .. }) {
+                s.run_started = Some(std::time::Instant::now());
+            }
+            s.status = status.clone();
+        }
+        self.out.status(status);
+    }
+
+    fn log(&self, line: &LogLine) {
+        {
+            let mut s = lock(&self.shared);
+            if s.log.len() >= LOG_BUFFER_LINES {
+                s.log.pop_front();
+            }
+            s.log.push_back(line.clone());
+        }
+        self.out.log(line);
+    }
+
+    fn rolled_back(&self, report: &RollbackReport) {
+        self.out.rolled_back(report);
+    }
+}
+
+/// After the game exits: a crash soon after starting undoes the mod updates made since the
+/// last good run; a clean exit, or a long enough run, keeps them.
+async fn settle_mod_updates(
+    mods: &ModStore,
+    instance_id: &str,
+    code: Option<i32>,
+    ran_secs: u64,
+    events: &Arc<dyn LaunchEvents>,
+) {
+    let failed_early = code != Some(0) && Duration::from_secs(ran_secs) < mods.startup_window();
+    if failed_early {
+        match mods.rollback_pending(instance_id).await {
+            Ok(report) if !report.is_empty() => events.rolled_back(&report),
+            Ok(_) => {}
+            Err(e) => tracing::warn!(error = %e, "could not roll back mod updates"),
+        }
+    } else if let Err(e) = mods.confirm_pending(instance_id).await {
+        tracing::warn!(error = %e, "could not confirm mod updates");
+    }
+}
+
+/// Runs at most one game at a time.
+#[derive(Clone, Default)]
+pub struct LaunchManager {
+    shared: Arc<Mutex<Shared>>,
+}
+
+impl std::fmt::Debug for LaunchManager {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("LaunchManager { .. }")
+    }
+}
+
+impl LaunchManager {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn status(&self) -> LaunchStatus {
+        lock(&self.shared).status.clone()
+    }
+
+    pub fn log_tail(&self) -> Vec<LogLine> {
+        lock(&self.shared).log.iter().cloned().collect()
+    }
+
+    /// The instance the game is currently starting or running from, if any.
+    pub fn running_instance(&self) -> Option<String> {
+        let s = lock(&self.shared);
+        s.status.is_active().then(|| s.instance.clone()).flatten()
+    }
+
+    pub fn is_active(&self) -> bool {
+        lock(&self.shared).status.is_active()
+    }
+
+    /// Begin preparing and launching in the background. Progress, output and the final
+    /// outcome arrive through `events`. Must be called inside a tokio runtime.
+    pub fn start(
+        &self,
+        deps: LaunchDeps,
+        req: LaunchRequest,
+        session: LaunchSession,
+        events: Arc<dyn LaunchEvents>,
+    ) -> Result<()> {
+        let stop = Arc::new(Notify::new());
+        {
+            let mut s = lock(&self.shared);
+            if s.status.is_active() {
+                return Err(LaunchError::AlreadyRunning.into());
+            }
+            s.status = LaunchStatus::preparing("Starting");
+            s.log.clear();
+            s.stop = Some(Arc::clone(&stop));
+            s.instance = req.instance_id.clone();
+            s.run_started = None;
+        }
+        let tee: Arc<dyn LaunchEvents> = Arc::new(Tee {
+            shared: Arc::clone(&self.shared),
+            out: events,
+        });
+        tee.status(&LaunchStatus::preparing("Starting"));
+        let shared = Arc::clone(&self.shared);
+        tokio::spawn(async move {
+            let work = async {
+                let prepared = prepare(&deps, &req, &session, &tee).await?;
+                spawn_and_stream(prepared, &tee).await
+            };
+            tokio::pin!(work);
+            let outcome = tokio::select! {
+                result = &mut work => Some(result),
+                () = stop.notified() => None,
+            };
+            let was_running = matches!(lock(&shared).status, LaunchStatus::Running { .. });
+            // `Some(code)` only when the game exited by itself (not when the user stopped it).
+            let exit_code = match &outcome {
+                Some(Ok(code)) => Some(*code),
+                _ => None,
+            };
+            let final_status = match outcome {
+                None if was_running => LaunchStatus::Exited { code: None },
+                None => LaunchStatus::Idle,
+                Some(Ok(code)) => LaunchStatus::Exited { code },
+                Some(Err(e)) => {
+                    let app = AppError::from(e);
+                    LaunchStatus::Failed {
+                        code: app.code.into(),
+                        message: app.message,
+                    }
+                }
+            };
+            let played = lock(&shared).run_started.map(|t| t.elapsed().as_secs());
+            lock(&shared).stop = None;
+            if let (Some(secs), Some(id), Some(store)) = (played, &req.instance_id, &deps.instances)
+            {
+                let secs = i64::try_from(secs).unwrap_or(i64::MAX);
+                let started = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(0))
+                    - secs;
+                if let Err(e) = store.record_play(id, started, secs).await {
+                    tracing::warn!(error = %e, "could not record play time");
+                }
+            }
+            if let (Some(code), Some(id), Some(mods)) = (exit_code, &req.instance_id, &deps.mods) {
+                settle_mod_updates(mods, id, code, played.unwrap_or(0), &tee).await;
+            }
+            tee.status(&final_status);
+        });
+        Ok(())
+    }
+
+    /// Cancel preparation or kill the running game.
+    pub fn stop(&self) -> Result<()> {
+        let s = lock(&self.shared);
+        match (&s.stop, s.status.is_active()) {
+            (Some(stop), true) => {
+                stop.notify_one();
+                Ok(())
+            }
+            _ => Err(LaunchError::NotRunning.into()),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Instant;
+
+    use serde_json::json;
+    use wiremock::matchers::path;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    use super::*;
+    use crate::auth::SecretString;
+    use crate::db;
+    use crate::download::{Downloader, RetryPolicy};
+    use crate::hash::{hash_bytes, HashAlgo};
+    use crate::net::{HostPolicy, HttpClient};
+    use crate::Error;
+
+    const TOKEN: &str = "TEST-ACCESS-TOKEN-1234567890";
+
+    #[derive(Default)]
+    struct Recorder {
+        statuses: Mutex<Vec<LaunchStatus>>,
+        lines: Mutex<Vec<LogLine>>,
+        rollbacks: Mutex<Vec<RollbackReport>>,
+    }
+
+    impl LaunchEvents for Recorder {
+        fn rolled_back(&self, r: &RollbackReport) {
+            self.rollbacks.lock().unwrap().push(r.clone());
+        }
+
+        fn status(&self, s: &LaunchStatus) {
+            self.statuses.lock().unwrap().push(s.clone());
+        }
+        fn log(&self, l: &LogLine) {
+            self.lines.lock().unwrap().push(l.clone());
+        }
+    }
+
+    fn sha1(b: &[u8]) -> String {
+        hash_bytes(HashAlgo::Sha1, b)
+    }
+
+    fn natives_zip() -> Vec<u8> {
+        use std::io::Write;
+        let mut w = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        let o = zip::write::SimpleFileOptions::default();
+        w.start_file("libfoo.so", o).unwrap();
+        w.write_all(b"native").unwrap();
+        w.start_file("META-INF/MANIFEST.MF", o).unwrap();
+        w.write_all(b"junk").unwrap();
+        w.finish().unwrap().into_inner()
+    }
+
+    struct World {
+        server: MockServer,
+        dir: tempfile::TempDir,
+        deps: LaunchDeps,
+        client_jar: Vec<u8>,
+    }
+
+    async fn mount(server: &MockServer, p: &str, body: Vec<u8>) {
+        Mock::given(path(p.to_owned()))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(body))
+            .mount(server)
+            .await;
+    }
+
+    /// A fake Mojang: manifest, version JSON, asset index, client jar, a library, natives.
+    async fn world(serve_client_jar: Option<Vec<u8>>) -> World {
+        let server = MockServer::start().await;
+        let s = server.uri();
+        let client_jar = b"CLIENT-JAR".to_vec();
+        let lib = b"LIB-JAR".to_vec();
+        let nat = natives_zip();
+        let (a1, a2) = (b"ASSET-ONE".to_vec(), b"ASSET-TWO".to_vec());
+        let index = json!({"objects": {
+            "icons/a.png": {"hash": sha1(&a1), "size": a1.len()},
+            "sounds/b.ogg": {"hash": sha1(&a2), "size": a2.len()},
+        }})
+        .to_string()
+        .into_bytes();
+        let file = |p: &str, url: &str, body: &[u8]| json!({"path": p, "url": format!("{s}{url}"), "sha1": sha1(body), "size": body.len()});
+        let version = json!({
+            "id": "test-1.0", "type": "release", "mainClass": "net.test.Main",
+            "assetIndex": {"id": "t1", "sha1": sha1(&index), "size": index.len(), "url": format!("{s}/assets-index.json")},
+            "downloads": {"client": file("", "/client.jar", &client_jar)},
+            "libraries": [
+                {"name": "a:lib:1", "downloads": {"artifact": file("a/lib/1/lib-1.jar", "/lib.jar", &lib)}},
+                {"name": "a:nat:1", "natives": {"linux": "n", "windows": "n", "osx": "n"},
+                 "extract": {"exclude": ["META-INF/"]},
+                 "downloads": {"classifiers": {"n": file("a/nat/1/nat-1-n.jar", "/nat.jar", &nat)}}}
+            ],
+            "arguments": {
+                "jvm": ["-Djava.library.path=${natives_directory}", "-cp", "${classpath}"],
+                "game": ["--username", "${auth_player_name}", "--accessToken", "${auth_access_token}",
+                         "--version", "${version_name}", "--clientId", "${clientid}"]
+            }
+        })
+        .to_string()
+        .into_bytes();
+        let manifest = json!({
+            "latest": {"release": "test-1.0", "snapshot": "test-1.0"},
+            "versions": [{"id": "test-1.0", "type": "release", "url": format!("{s}/version.json"),
+                          "sha1": sha1(&version), "releaseTime": "2024-01-01T00:00:00+00:00"}]
+        })
+        .to_string()
+        .into_bytes();
+
+        mount(&server, "/manifest.json", manifest).await;
+        mount(&server, "/version.json", version).await;
+        mount(&server, "/assets-index.json", index).await;
+        mount(
+            &server,
+            "/client.jar",
+            serve_client_jar.unwrap_or_else(|| client_jar.clone()),
+        )
+        .await;
+        mount(&server, "/lib.jar", lib).await;
+        mount(&server, "/nat.jar", nat).await;
+        for a in [&a1, &a2] {
+            let h = sha1(a);
+            mount(&server, &format!("/assets/{}/{h}", &h[..2]), a.clone()).await;
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let dirs = DataDirs::from_root(dir.path().join("data"), false);
+        dirs.ensure_created().unwrap();
+        let policy = || HostPolicy::new(&[]).with_loopback_http();
+        let downloader = || {
+            Downloader::new(HttpClient::new_for_downloads("t/0", policy()).unwrap(), 4).with_retry(
+                RetryPolicy {
+                    attempts: 2,
+                    base_delay: Duration::from_millis(1),
+                },
+            )
+        };
+        let mojang = MojangClient::with_clients(
+            HttpClient::new("t/0", policy()).unwrap(),
+            downloader(),
+            &dirs.cache,
+            format!("{s}/manifest.json"),
+            format!("{s}/assets/"),
+        );
+        let db = db::open_in_memory().await.unwrap();
+        let loaders = LoaderClient::with_clients(
+            HttpClient::new("t/0", policy()).unwrap(),
+            downloader(),
+            mojang.clone(),
+            crate::loader::Endpoints {
+                fabric_meta: s.clone(),
+                quilt_meta: format!("{s}/quilt"),
+                neoforge_maven: format!("{s}/neo"),
+                forge_maven: format!("{s}/forge"),
+            },
+        );
+        let java = JavaManager::with_clients(
+            db,
+            &dirs.java,
+            HttpClient::new("t/0", policy()).unwrap(),
+            downloader(),
+            s,
+        );
+        World {
+            server,
+            dir,
+            deps: LaunchDeps {
+                dirs,
+                mojang,
+                java,
+                loaders,
+                instances: None,
+                mods: None,
+            },
+            client_jar,
+        }
+    }
+
+    fn session() -> LaunchSession {
+        LaunchSession {
+            account_id: "069a79f44e9d4e9cb12bd4a2bb7d6fd4".into(),
+            username: "Steve_Test".into(),
+            access_token: SecretString::new(TOKEN),
+        }
+    }
+
+    fn req_for(w: &World, mc: &str, java: Option<PathBuf>) -> LaunchRequest {
+        LaunchRequest {
+            mc_version: mc.into(),
+            loader: LoaderKind::Vanilla,
+            loader_version: None,
+            game_dir: SafePath::new(&w.deps.dirs.instances, "vanilla-test").unwrap(),
+            instance_id: None,
+            ram_mb: Some(1024),
+            jvm_args: vec!["-Xss1M".into()],
+            java_path: java,
+        }
+    }
+
+    fn request(w: &World, java: Option<PathBuf>) -> LaunchRequest {
+        req_for(w, "test-1.0", java)
+    }
+
+    fn recorder() -> (Arc<Recorder>, Arc<dyn LaunchEvents>) {
+        let r = Arc::new(Recorder::default());
+        (r.clone(), r)
+    }
+
+    async fn request_count(w: &World) -> usize {
+        w.server.received_requests().await.unwrap().len()
+    }
+
+    #[tokio::test]
+    async fn prepare_downloads_everything_and_builds_the_command() {
+        let w = world(None).await;
+        let (rec, events) = recorder();
+        let p = prepare(
+            &w.deps,
+            &request(&w, Some("/bin/true".into())),
+            &session(),
+            &events,
+        )
+        .await
+        .unwrap();
+
+        // Files landed in the content-addressed cache.
+        let cache = &w.deps.dirs.cache;
+        assert_eq!(
+            std::fs::read(cache.join("jars/test-1.0/test-1.0.jar")).unwrap(),
+            w.client_jar
+        );
+        assert!(cache.join("libraries/a/lib/1/lib-1.jar").is_file());
+        let h = sha1(b"ASSET-ONE");
+        assert!(cache
+            .join(format!("assets/objects/{}/{h}", &h[..2]))
+            .is_file());
+        assert!(cache.join("assets/indexes/t1.json").is_file());
+
+        // Natives were unpacked flat, minus the excluded entries.
+        let natives = p.game_dir.join(".kiln-natives");
+        assert_eq!(std::fs::read(natives.join("libfoo.so")).unwrap(), b"native");
+        assert!(!natives.join("META-INF").exists());
+
+        // The command line.
+        let a = &p.args;
+        assert_eq!(
+            &a[..2],
+            ["-Xmx1024M", "-Xss1M"],
+            "RAM and vetted extra JVM flags come first"
+        );
+        assert!(a.contains(&format!("-Djava.library.path={}", natives.display())));
+        let cp = &a[a.iter().position(|x| x == "-cp").unwrap() + 1];
+        assert!(
+            cp.contains("lib-1.jar") && cp.ends_with("test-1.0.jar"),
+            "{cp}"
+        );
+        let main = a.iter().position(|x| x == "net.test.Main").unwrap();
+        assert_eq!(&a[main + 1..main + 3], ["--username", "Steve_Test"]);
+        assert!(a.windows(2).any(|w| w == ["--accessToken", TOKEN]));
+        assert!(
+            !a.contains(&"--clientId".to_string()),
+            "valueless flags are dropped"
+        );
+        assert!(
+            !format!("{p:?}").contains(TOKEN),
+            "Debug must hide the token"
+        );
+
+        // Progress and stage changes were reported.
+        let statuses = rec.statuses.lock().unwrap();
+        assert!(statuses.iter().any(|s| matches!(s, LaunchStatus::Preparing { stage, .. } if stage == "Downloading game files")));
+    }
+
+    #[tokio::test]
+    async fn a_second_prepare_reuses_the_cache() {
+        let w = world(None).await;
+        let (_r, events) = recorder();
+        prepare(
+            &w.deps,
+            &request(&w, Some("/bin/true".into())),
+            &session(),
+            &events,
+        )
+        .await
+        .unwrap();
+        let before = request_count(&w).await;
+        prepare(
+            &w.deps,
+            &request(&w, Some("/bin/true".into())),
+            &session(),
+            &events,
+        )
+        .await
+        .unwrap();
+        // Only the version list is fetched again; every file is already cached.
+        assert_eq!(request_count(&w).await, before + 1);
+    }
+
+    #[tokio::test]
+    async fn a_tampered_client_jar_is_rejected_before_anything_runs() {
+        let w = world(Some(b"EVIL--JAR!".to_vec())).await;
+        let (_r, events) = recorder();
+        let err = prepare(
+            &w.deps,
+            &request(&w, Some("/bin/true".into())),
+            &session(),
+            &events,
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, Error::HashMismatch { .. }), "{err:?}");
+        assert!(!w
+            .deps
+            .dirs
+            .cache
+            .join("jars/test-1.0/test-1.0.jar")
+            .exists());
+    }
+
+    #[tokio::test]
+    async fn bad_version_ids_never_touch_the_network_or_disk() {
+        let w = world(None).await;
+        let (_r, events) = recorder();
+        for bad in ["../evil", "a/b", ""] {
+            let req = req_for(&w, bad, None);
+            let err = prepare(&w.deps, &req, &session(), &events)
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(err, Error::Launch(LaunchError::InvalidVersionId)),
+                "{bad}: {err:?}"
+            );
+        }
+        assert_eq!(request_count(&w).await, 0);
+    }
+
+    #[tokio::test]
+    async fn unknown_versions_are_reported() {
+        let w = world(None).await;
+        let (_r, events) = recorder();
+        let req = req_for(&w, "9.9.9", None);
+        let err = prepare(&w.deps, &req, &session(), &events)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, Error::Launch(LaunchError::UnknownVersion(_))),
+            "{err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn saved_data_lets_an_installed_version_prepare_offline() {
+        let w = world(None).await;
+        let (_r, events) = recorder();
+        prepare(
+            &w.deps,
+            &request(&w, Some("/bin/true".into())),
+            &session(),
+            &events,
+        )
+        .await
+        .unwrap();
+        // Unreachable server from now on: stop answering by dropping the mounts.
+        w.server.reset().await;
+        prepare(
+            &w.deps,
+            &request(&w, Some("/bin/true".into())),
+            &session(),
+            &events,
+        )
+        .await
+        .expect("cached files should be enough offline");
+    }
+
+    #[cfg(unix)]
+    fn fake_java(dir: &std::path::Path, body: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let p = dir.join("fake-java.sh");
+        std::fs::write(&p, format!("#!/bin/sh\n{body}\n")).unwrap();
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+        p
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn output_is_streamed_with_the_token_masked_and_the_exit_code_reported() {
+        let w = world(None).await;
+        let java = fake_java(
+            w.dir.path(),
+            "for a in \"$@\"; do echo \"ARG:$a\"; done\necho oops-on-stderr >&2\nprintf 'bad\\377bytes\\n'\nexit 3",
+        );
+        let (rec, events) = recorder();
+        let prepared = prepare(&w.deps, &request(&w, Some(java)), &session(), &events)
+            .await
+            .unwrap();
+        let code = spawn_and_stream(prepared, &events).await.unwrap();
+        assert_eq!(code, Some(3));
+
+        let lines = rec.lines.lock().unwrap();
+        assert!(lines
+            .iter()
+            .any(|l| l.stream == LogStream::Stdout && l.text == "ARG:net.test.Main"));
+        assert!(lines
+            .iter()
+            .any(|l| l.stream == LogStream::Stderr && l.text == "oops-on-stderr"));
+        assert!(
+            lines.iter().any(|l| l.text.starts_with("bad")),
+            "invalid UTF-8 must not end the stream"
+        );
+        // The fake game printed its own arguments, token included: none may get through.
+        assert!(lines.iter().all(|l| !l.text.contains(TOKEN)), "{lines:?}");
+        assert!(lines.iter().any(|l| l.text.contains("[REDACTED]")));
+        assert!(rec
+            .statuses
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|s| matches!(s, LaunchStatus::Running { .. })));
+    }
+
+    #[cfg(unix)]
+    async fn wait_for(m: &LaunchManager, pred: impl Fn(&LaunchStatus) -> bool) -> LaunchStatus {
+        let start = Instant::now();
+        loop {
+            let s = m.status();
+            if pred(&s) {
+                return s;
+            }
+            assert!(
+                start.elapsed() < Duration::from_secs(20),
+                "timed out in {s:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_manager_runs_one_game_stops_it_and_keeps_a_log() {
+        let w = world(None).await;
+        let java = fake_java(w.dir.path(), "echo started\nsleep 30");
+        let manager = LaunchManager::new();
+        let (rec, events) = recorder();
+        assert_eq!(manager.status(), LaunchStatus::Idle);
+        assert!(matches!(
+            manager.stop(),
+            Err(Error::Launch(LaunchError::NotRunning))
+        ));
+
+        manager
+            .start(
+                clone_deps(&w),
+                request(&w, Some(java.clone())),
+                session(),
+                events.clone(),
+            )
+            .unwrap();
+        wait_for(&manager, |s| matches!(s, LaunchStatus::Running { .. })).await;
+
+        let second = manager.start(clone_deps(&w), request(&w, Some(java)), session(), events);
+        assert!(matches!(
+            second,
+            Err(Error::Launch(LaunchError::AlreadyRunning))
+        ));
+
+        // The output so far is available to a console opened late.
+        let start = Instant::now();
+        while manager.log_tail().is_empty() && start.elapsed() < Duration::from_secs(10) {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(manager.log_tail()[0].text, "started");
+
+        manager.stop().unwrap();
+        let s = wait_for(&manager, |s| matches!(s, LaunchStatus::Exited { .. })).await;
+        assert_eq!(s, LaunchStatus::Exited { code: None });
+        assert!(!manager.is_active());
+        assert!(rec
+            .statuses
+            .lock()
+            .unwrap()
+            .last()
+            .is_some_and(|s| matches!(s, LaunchStatus::Exited { .. })));
+    }
+
+    #[tokio::test]
+    async fn failures_become_a_failed_status_with_a_plain_message() {
+        let w = world(None).await;
+        let manager = LaunchManager::new();
+        let (_r, events) = recorder();
+        let req = req_for(&w, "9.9.9", None);
+        manager.start(w.deps, req, session(), events).unwrap();
+        let start = Instant::now();
+        let status = loop {
+            let s = manager.status();
+            if matches!(s, LaunchStatus::Failed { .. }) {
+                break s;
+            }
+            assert!(start.elapsed() < Duration::from_secs(20), "{s:?}");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        };
+        let LaunchStatus::Failed { code, message } = status else {
+            unreachable!()
+        };
+        assert_eq!(code, "unknown_version");
+        assert!(message.contains("9.9.9"));
+        // And a new launch is allowed afterwards.
+        assert!(!manager.is_active());
+    }
+
+    #[tokio::test]
+    async fn a_fabric_instance_merges_the_loader_profile_onto_vanilla() {
+        let w = world(None).await;
+        let s = w.server.uri();
+        let loader_jar = b"FABRIC-LOADER-JAR".to_vec();
+        mount(
+            &w.server,
+            "/maven/net/fabricmc/fabric-loader/0.16.5/fabric-loader-0.16.5.jar",
+            loader_jar.clone(),
+        )
+        .await;
+        mount(
+            &w.server,
+            "/maven/net/fabricmc/fabric-loader/0.16.5/fabric-loader-0.16.5.jar.sha1",
+            sha1(&loader_jar).into_bytes(),
+        )
+        .await;
+        mount(&w.server, "/v2/versions/loader/test-1.0/0.16.5/profile/json", json!({
+            "id": "fabric-loader-0.16.5-test-1.0", "inheritsFrom": "test-1.0", "type": "release",
+            "mainClass": "net.fabricmc.loader.impl.launch.knot.KnotClient",
+            "arguments": {"game": [], "jvm": ["-DFabricMcEmu= net.minecraft.client.main.Main "]},
+            "libraries": [{"name": "net.fabricmc:fabric-loader:0.16.5", "url": format!("{s}/maven/")}]
+        }).to_string().into_bytes()).await;
+
+        let mut req = request(&w, Some("/bin/true".into()));
+        req.loader = LoaderKind::Fabric;
+        req.loader_version = Some("0.16.5".into());
+        let (_r, events) = recorder();
+        let p = prepare(&w.deps, &req, &session(), &events).await.unwrap();
+
+        let a = &p.args;
+        assert!(a.contains(&"net.fabricmc.loader.impl.launch.knot.KnotClient".to_string()));
+        assert!(
+            !a.contains(&"net.test.Main".to_string()),
+            "the loader's main class replaces vanilla's"
+        );
+        assert!(
+            a.contains(&"-DFabricMcEmu= net.minecraft.client.main.Main ".to_string()),
+            "a JVM argument containing spaces stays one argument"
+        );
+        let cp = &a[a.iter().position(|x| x == "-cp").unwrap() + 1];
+        let (fabric_at, lib_at) = (
+            cp.find("fabric-loader-0.16.5.jar").unwrap(),
+            cp.find("lib-1.jar").unwrap(),
+        );
+        assert!(fabric_at < lib_at, "loader libraries come first: {cp}");
+        assert_eq!(
+            std::fs::read(
+                w.deps
+                    .dirs
+                    .cache
+                    .join("libraries/net/fabricmc/fabric-loader/0.16.5/fabric-loader-0.16.5.jar")
+            )
+            .unwrap(),
+            loader_jar
+        );
+        assert!(
+            a.windows(2)
+                .any(|x| x == ["--version", "fabric-loader-0.16.5-test-1.0"]),
+            "version_name is the profile id"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_tampered_loader_library_is_rejected() {
+        let w = world(None).await;
+        let s = w.server.uri();
+        mount(&w.server, "/maven/x/y/1/y-1.jar", b"EVIL".to_vec()).await;
+        mount(
+            &w.server,
+            "/maven/x/y/1/y-1.jar.sha1",
+            sha1(b"GOOD").into_bytes(),
+        )
+        .await;
+        mount(
+            &w.server,
+            "/v2/versions/loader/test-1.0/1/profile/json",
+            json!({
+                "id": "p", "inheritsFrom": "test-1.0", "type": "release", "mainClass": "M",
+                "libraries": [{"name": "x:y:1", "url": format!("{s}/maven/")}]
+            })
+            .to_string()
+            .into_bytes(),
+        )
+        .await;
+        let mut req = request(&w, Some("/bin/true".into()));
+        req.loader = LoaderKind::Fabric;
+        req.loader_version = Some("1".into());
+        let (_r, events) = recorder();
+        let err = prepare(&w.deps, &req, &session(), &events)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::HashMismatch { .. }), "{err:?}");
+        assert!(!w.deps.dirs.cache.join("libraries/x/y/1/y-1.jar").exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn play_time_is_recorded_for_stored_instances() {
+        let w = world(None).await;
+        let store = InstanceStore::new(db::open_in_memory().await.unwrap(), &w.deps.dirs.instances);
+        let inst = store
+            .create(crate::instance::NewInstance {
+                name: "T".into(),
+                mc_version: "test-1.0".into(),
+                loader: LoaderKind::Vanilla,
+                loader_version: None,
+            })
+            .await
+            .unwrap();
+        let java = fake_java(w.dir.path(), "sleep 1");
+        let mut req = request(&w, Some(java));
+        req.game_dir = store.game_dir(&inst.id).await.unwrap();
+        req.instance_id = Some(inst.id.clone());
+        let manager = LaunchManager::new();
+        let (_r, events) = recorder();
+        manager
+            .start(
+                LaunchDeps {
+                    instances: Some(store.clone()),
+                    ..clone_deps(&w)
+                },
+                req,
+                session(),
+                events,
+            )
+            .unwrap();
+        assert_eq!(
+            manager.running_instance().as_deref(),
+            Some(inst.id.as_str())
+        );
+        wait_for(&manager, |s| matches!(s, LaunchStatus::Exited { .. })).await;
+        let played = store.get(&inst.id).await.unwrap();
+        assert!(
+            played.playtime_s >= 1 && played.last_played.is_some(),
+            "{played:?}"
+        );
+        assert_eq!(manager.running_instance(), None);
+    }
+
+    fn clone_deps(w: &World) -> LaunchDeps {
+        LaunchDeps {
+            dirs: w.deps.dirs.clone(),
+            mojang: w.deps.mojang.clone(),
+            java: w.deps.java.clone(),
+            loaders: w.deps.loaders.clone(),
+            instances: None,
+            mods: None,
+        }
+    }
+
+    /// An instance whose mods folder holds `a-2.jar`, installed by an update that replaced
+    /// `a-1.jar` and hasn't been proven yet.
+    #[cfg(unix)]
+    async fn instance_with_pending_update(
+        w: &World,
+        window: Duration,
+    ) -> (InstanceStore, crate::mods::store::ModStore, String) {
+        let db = db::open_in_memory().await.unwrap();
+        let store = InstanceStore::new(db.clone(), &w.deps.dirs.instances);
+        let inst = store
+            .create(crate::instance::NewInstance {
+                name: "T".into(),
+                mc_version: "test-1.0".into(),
+                loader: LoaderKind::Vanilla,
+                loader_version: None,
+            })
+            .await
+            .unwrap();
+        let mods = crate::mods::store::ModStore::new(db, store.clone(), &w.deps.dirs.backups)
+            .with_startup_window(window);
+        let dir = mods.mods_dir(&inst.id).await.unwrap();
+        std::fs::create_dir_all(dir.as_path()).unwrap();
+        std::fs::write(dir.as_path().join("a-1.jar"), b"OLD").unwrap();
+        mods.sync(&inst.id).await.unwrap();
+        let old = mods.list(&inst.id).await.unwrap().remove(0);
+        mods.backup_for_update(&inst.id, &old, "a-2.jar")
+            .await
+            .unwrap();
+        std::fs::remove_file(dir.as_path().join("a-1.jar")).unwrap();
+        std::fs::write(dir.as_path().join("a-2.jar"), b"NEW").unwrap();
+        mods.sync(&inst.id).await.unwrap();
+        assert_eq!(mods.pending_updates(&inst.id).await.unwrap(), 1);
+        (store, mods, inst.id)
+    }
+
+    #[cfg(unix)]
+    async fn play(
+        w: &World,
+        store: &InstanceStore,
+        mods: &crate::mods::store::ModStore,
+        id: &str,
+        java_body: &str,
+    ) -> (LaunchManager, Arc<Recorder>) {
+        let java = fake_java(w.dir.path(), java_body);
+        let mut req = request(w, Some(java));
+        req.game_dir = store.game_dir(id).await.unwrap();
+        req.instance_id = Some(id.to_owned());
+        let manager = LaunchManager::new();
+        let (rec, events) = recorder();
+        manager
+            .start(
+                LaunchDeps {
+                    instances: Some(store.clone()),
+                    mods: Some(mods.clone()),
+                    ..clone_deps(w)
+                },
+                req,
+                session(),
+                events,
+            )
+            .unwrap();
+        (manager, rec)
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_crash_right_after_a_mod_update_rolls_the_update_back() {
+        let w = world(None).await;
+        let (store, mods, id) = instance_with_pending_update(&w, Duration::from_secs(60)).await;
+        let (manager, rec) = play(&w, &store, &mods, &id, "exit 1").await;
+        wait_for(&manager, |s| matches!(s, LaunchStatus::Exited { .. })).await;
+
+        let dir = mods.mods_dir(&id).await.unwrap().as_path().to_path_buf();
+        assert_eq!(std::fs::read(dir.join("a-1.jar")).unwrap(), b"OLD");
+        assert!(!dir.join("a-2.jar").exists());
+        assert_eq!(mods.pending_updates(&id).await.unwrap(), 0);
+        let reports = rec.rollbacks.lock().unwrap();
+        assert_eq!(reports.len(), 1);
+        assert_eq!(reports[0].restored, ["a-1.jar"]);
+        assert_eq!(reports[0].instance_id, id);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_clean_exit_keeps_the_update() {
+        let w = world(None).await;
+        let (store, mods, id) = instance_with_pending_update(&w, Duration::from_secs(60)).await;
+        let (manager, rec) = play(&w, &store, &mods, &id, "exit 0").await;
+        wait_for(&manager, |s| matches!(s, LaunchStatus::Exited { .. })).await;
+        let dir = mods.mods_dir(&id).await.unwrap().as_path().to_path_buf();
+        assert!(dir.join("a-2.jar").exists() && !dir.join("a-1.jar").exists());
+        assert_eq!(
+            mods.pending_updates(&id).await.unwrap(),
+            0,
+            "confirmed, not pending"
+        );
+        assert!(rec.rollbacks.lock().unwrap().is_empty());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_crash_after_the_game_ran_a_while_is_not_blamed_on_the_update() {
+        let w = world(None).await;
+        // A zero-length window: every run counts as having started fine.
+        let (store, mods, id) = instance_with_pending_update(&w, Duration::ZERO).await;
+        let (manager, rec) = play(&w, &store, &mods, &id, "exit 1").await;
+        wait_for(&manager, |s| matches!(s, LaunchStatus::Exited { .. })).await;
+        let dir = mods.mods_dir(&id).await.unwrap().as_path().to_path_buf();
+        assert!(dir.join("a-2.jar").exists());
+        assert!(rec.rollbacks.lock().unwrap().is_empty());
+        assert_eq!(mods.pending_updates(&id).await.unwrap(), 0);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stopping_the_game_yourself_decides_nothing_about_the_update() {
+        let w = world(None).await;
+        let (store, mods, id) = instance_with_pending_update(&w, Duration::from_secs(60)).await;
+        let (manager, rec) = play(&w, &store, &mods, &id, "sleep 30").await;
+        wait_for(&manager, |s| matches!(s, LaunchStatus::Running { .. })).await;
+        manager.stop().unwrap();
+        wait_for(&manager, |s| {
+            matches!(s, LaunchStatus::Exited { .. } | LaunchStatus::Idle)
+        })
+        .await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let dir = mods.mods_dir(&id).await.unwrap().as_path().to_path_buf();
+        assert!(dir.join("a-2.jar").exists());
+        assert_eq!(mods.pending_updates(&id).await.unwrap(), 1);
+        assert!(rec.rollbacks.lock().unwrap().is_empty());
+    }
+}
+
+<<<<<KILN-END>>>>>
+<<<<<KILN-FILE crates/kiln-core/src/launch/mod.rs>>>>>
+//! Launching the game: prepare files, build the command line, run Java, stream its output.
+
+mod args;
+mod error;
+mod manager;
+
+pub use args::{build_args, ArgContext};
+pub use error::LaunchError;
+pub use manager::{
+    prepare, spawn_and_stream, LaunchDeps, LaunchEvents, LaunchManager, LaunchRequest,
+    LaunchStatus, LogLine, LogStream, Prepared,
+};
+
+/// Stop Windows from flashing a console window for every child process.
+pub(crate) fn hide_console_window(cmd: &mut tokio::process::Command) {
+    #[cfg(windows)]
+    {
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = cmd;
+    }
+}
+
+<<<<<KILN-END>>>>>
+<<<<<KILN-FILE crates/kiln-core/src/loader/forge.rs>>>>>
+//! Forge and NeoForge: download the official installer, verify it, unpack its libraries and
+//! run its processors headlessly, exactly as `--installClient` would.
+//!
+//! Trust note: processors are Java programs from the installer, run with the user's
+//! privileges. The installer is checked against the SHA-1 its Maven repository publishes,
+//! which protects against corruption and a bad mirror but not a compromised repository.
+//! Each processor's outputs are verified against the hashes the installer declares.
+
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::time::Duration;
+
+use serde::Deserialize;
+
+use super::{write_atomic, InstallContext, LoaderClient, LoaderKind};
+use crate::archive::{extract_zip, read_zip_entry, ExtractOptions};
+use crate::download::DownloadTask;
+use crate::hash::{hash_file, ExpectedHash, HashAlgo};
+use crate::launch::LaunchError;
+use crate::mojang::version::{maven_path, Library};
+use crate::mojang::{LibraryFile, VersionJson};
+use crate::paths::SafePath;
+use crate::{redact, Error, Result};
+
+const MAX_PROFILE_BYTES: u64 = 16 * 1024 * 1024;
+const MAX_DATA_BYTES: u64 = 512 * 1024 * 1024;
+const PROCESSOR_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+
+#[derive(Deserialize)]
+struct InstallProfile {
+    #[serde(default)]
+    data: HashMap<String, DataEntry>,
+    #[serde(default)]
+    processors: Vec<Processor>,
+    #[serde(default)]
+    libraries: Vec<Library>,
+    json: String,
+}
+
+#[derive(Deserialize)]
+struct DataEntry {
+    client: String,
+}
+
+#[derive(Deserialize)]
+struct Processor {
+    #[serde(default)]
+    sides: Option<Vec<String>>,
+    jar: String,
+    #[serde(default)]
+    classpath: Vec<String>,
+    #[serde(default)]
+    args: Vec<String>,
+    #[serde(default)]
+    outputs: HashMap<String, String>,
+}
+
+fn fail(msg: impl Into<String>) -> Error {
+    LaunchError::LoaderInstall(msg.into()).into()
+}
+
+/// `[group:artifact:version@ext]` to its path inside the libraries folder.
+fn coord_path(libs: &Path, coord: &str) -> Result<String> {
+    let rel = maven_path(coord).ok_or_else(|| fail(format!("bad library coordinate {coord}")))?;
+    Ok(SafePath::new(libs, &rel)?
+        .as_path()
+        .to_string_lossy()
+        .into_owned())
+}
+
+fn bracketed(s: &str) -> Option<&str> {
+    s.strip_prefix('[')?.strip_suffix(']')
+}
+
+/// Replace `{KEY}` placeholders and `[coordinate]` tokens in a processor argument.
+fn substitute(arg: &str, vars: &HashMap<String, String>, libs: &Path) -> Result<String> {
+    if let Some(coord) = bracketed(arg) {
+        return coord_path(libs, coord);
+    }
+    let mut out = String::new();
+    let mut rest = arg;
+    while let Some(start) = rest.find('{') {
+        out.push_str(&rest[..start]);
+        let after = &rest[start + 1..];
+        let end = after
+            .find('}')
+            .ok_or_else(|| fail(format!("unterminated placeholder in {arg}")))?;
+        let value = vars
+            .get(&after[..end])
+            .ok_or_else(|| fail(format!("unknown placeholder {}", &after[..end])))?;
+        out.push_str(value);
+        rest = &after[end + 1..];
+    }
+    out.push_str(rest);
+    Ok(out)
+}
+
+/// `'abc'` to `abc`.
+fn unquote(s: &str) -> &str {
+    s.strip_prefix('\'')
+        .and_then(|s| s.strip_suffix('\''))
+        .unwrap_or(s)
+}
+
+fn manifest_main_class(jar: &Path) -> Result<String> {
+    let manifest = read_zip_entry(jar, "META-INF/MANIFEST.MF", 1024 * 1024)?;
+    String::from_utf8_lossy(&manifest)
+        .lines()
+        .find_map(|l| l.strip_prefix("Main-Class:").map(|v| v.trim().to_owned()))
+        .ok_or_else(|| fail("a processor jar has no Main-Class"))
+}
+
+async fn outputs_valid(outputs: &[(PathBuf, ExpectedHash)]) -> bool {
+    for (path, expected) in outputs {
+        match hash_file(expected.algo(), path).await {
+            Ok(actual) if actual == expected.hex() => {}
+            _ => return false,
+        }
+    }
+    true
+}
+
+pub(super) async fn install(
+    c: &LoaderClient,
+    kind: LoaderKind,
+    mc: &str,
+    lv: &str,
+    key: &str,
+    dest: &SafePath,
+    ctx: &InstallContext<'_>,
+) -> Result<VersionJson> {
+    let (installer_url, installer_name) = match kind {
+        LoaderKind::Neoforge => (
+            format!(
+                "{0}/net/neoforged/neoforge/{lv}/neoforge-{lv}-installer.jar",
+                c.ep.neoforge_maven
+            ),
+            "neoforge",
+        ),
+        _ => {
+            let full = format!("{mc}-{lv}");
+            (
+                format!(
+                    "{0}/net/minecraftforge/forge/{full}/forge-{full}-installer.jar",
+                    c.ep.forge_maven
+                ),
+                "forge",
+            )
+        }
+    };
+    let loaders = c.cache_dir("loaders")?;
+    let libs = c.cache_dir("libraries")?;
+    let installer = SafePath::new(&loaders, &format!("{key}-installer.jar"))?;
+    c.downloader
+        .download(DownloadTask {
+            hash: Some(c.fetch_sha1(&installer_url).await?),
+            url: installer_url,
+            dest: installer.clone(),
+            size: None,
+        })
+        .await?;
+
+    // Read the profile, unpack the installer's bundled libraries.
+    let (installer_path, libs_root) = (installer.as_path().to_path_buf(), libs.clone());
+    let (profile, version_bytes) =
+        tokio::task::spawn_blocking(move || -> Result<(InstallProfile, Vec<u8>)> {
+            let profile: InstallProfile = serde_json::from_slice(&read_zip_entry(
+                &installer_path,
+                "install_profile.json",
+                MAX_PROFILE_BYTES,
+            )?)?;
+            let version = read_zip_entry(
+                &installer_path,
+                profile.json.trim_start_matches('/'),
+                MAX_PROFILE_BYTES,
+            )?;
+            let keep = |n: &str| n.starts_with("maven/");
+            extract_zip(
+                &installer_path,
+                &libs_root,
+                &ExtractOptions {
+                    strip_components: 1,
+                    filter: Some(&keep),
+                    ..Default::default()
+                },
+            )?;
+            Ok((profile, version))
+        })
+        .await
+        .map_err(|e| Error::Io(std::io::Error::other(e)))??;
+
+    // Libraries the processors themselves need. Entries without a URL ship inside the
+    // installer and were just unpacked.
+    let mut tasks = Vec::new();
+    for lib in &profile.libraries {
+        let Some(a) = lib.downloads.as_ref().and_then(|d| d.artifact.as_ref()) else {
+            continue;
+        };
+        if a.url.is_empty() {
+            continue;
+        }
+        let file = LibraryFile {
+            path: a
+                .path
+                .clone()
+                .ok_or_else(|| fail(format!("{} has no path", lib.name)))?,
+            url: a.url.clone(),
+            sha1: a.sha1.clone(),
+            size: a.size,
+        };
+        tasks.push(c.mojang.library_task(&file)?);
+    }
+    c.downloader.download_all(tasks, None).await?;
+
+    // Variables for processor arguments.
+    let work = SafePath::new(&loaders, &format!("{key}-work"))?;
+    let _ = std::fs::remove_dir_all(work.as_path());
+    std::fs::create_dir_all(work.as_path())?;
+    let mut vars: HashMap<String, String> = HashMap::new();
+    let path_str = |p: &Path| p.to_string_lossy().into_owned();
+    for (name, value) in [
+        ("SIDE", "client".to_owned()),
+        ("MINECRAFT_VERSION", mc.to_owned()),
+        ("MINECRAFT_JAR", path_str(ctx.client_jar)),
+        (
+            "ROOT",
+            path_str(
+                &loaders
+                    .parent()
+                    .map(Path::to_path_buf)
+                    .unwrap_or_else(|| loaders.clone()),
+            ),
+        ),
+        ("INSTALLER", path_str(installer.as_path())),
+        ("LIBRARY_DIR", path_str(&libs)),
+    ] {
+        vars.insert(name.into(), value);
+    }
+    for (name, entry) in &profile.data {
+        let value = &entry.client;
+        let resolved = if let Some(coord) = bracketed(value) {
+            coord_path(&libs, coord)?
+        } else if let Some(file) = value.strip_prefix('/') {
+            let leaf = file.rsplit('/').next().unwrap_or(file);
+            let bytes = read_zip_entry(installer.as_path(), file, MAX_DATA_BYTES)?;
+            let target = SafePath::new(work.as_path(), leaf)?;
+            std::fs::write(target.as_path(), bytes)?;
+            path_str(target.as_path())
+        } else {
+            unquote(value).to_owned()
+        };
+        vars.insert(name.clone(), resolved);
+    }
+
+    for processor in profile.processors.iter().filter(|p| {
+        p.sides
+            .as_ref()
+            .is_none_or(|s| s.iter().any(|x| x == "client"))
+    }) {
+        let mut outputs = Vec::new();
+        for (path, hash) in &processor.outputs {
+            let path = substitute(path, &vars, &libs)?;
+            let hash =
+                ExpectedHash::new(HashAlgo::Sha1, unquote(&substitute(hash, &vars, &libs)?))?;
+            outputs.push((PathBuf::from(path), hash));
+        }
+        if !outputs.is_empty() && outputs_valid(&outputs).await {
+            continue; // already produced by an earlier install
+        }
+        let jar = coord_path(&libs, &processor.jar)?;
+        let main = manifest_main_class(Path::new(&jar))?;
+        let mut classpath = vec![jar];
+        for dep in &processor.classpath {
+            classpath.push(coord_path(&libs, dep)?);
+        }
+        let args = processor
+            .args
+            .iter()
+            .map(|a| substitute(a, &vars, &libs))
+            .collect::<Result<Vec<_>>>()?;
+
+        let mut cmd = tokio::process::Command::new(ctx.java);
+        cmd.arg("-cp")
+            .arg(classpath.join(if cfg!(windows) { ";" } else { ":" }))
+            .arg(&main)
+            .args(&args)
+            .current_dir(work.as_path())
+            .stdin(std::process::Stdio::null())
+            .kill_on_drop(true);
+        crate::launch::hide_console_window(&mut cmd);
+        let output = tokio::time::timeout(PROCESSOR_TIMEOUT, cmd.output())
+            .await
+            .map_err(|_| fail("a loader installer step timed out"))?
+            .map_err(|e| fail(format!("couldn't run Java: {}", e.kind())))?;
+        if !output.status.success() {
+            let text = format!(
+                "{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let tail: String = text
+                .chars()
+                .rev()
+                .take(600)
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+                .collect();
+            return Err(fail(format!(
+                "an installer step failed: {}",
+                redact::global().redact(&tail)
+            )));
+        }
+        if !outputs.is_empty() && !outputs_valid(&outputs).await {
+            return Err(fail(
+                "an installer step produced a file that doesn't match its expected checksum",
+            ));
+        }
+    }
+
+    let parsed: VersionJson = serde_json::from_slice(&version_bytes)?;
+    if parsed.inherits_from.as_deref() != Some(mc) {
+        return Err(fail(
+            "the installer's profile is for a different Minecraft version",
+        ));
+    }
+    write_atomic(dest.as_path(), &version_bytes)?;
+    let _ = std::fs::remove_dir_all(work.as_path());
+    let _ = std::fs::remove_file(installer.as_path());
+    tracing::info!(loader = installer_name, "installed a mod loader");
+    Ok(parsed)
+}
+
+#[cfg(test)]
+#[cfg(unix)]
+mod tests {
+    use std::io::Write;
+    use std::os::unix::fs::PermissionsExt;
+
+    use serde_json::json;
+    use wiremock::matchers::path;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    use super::super::tests::test_client;
+    use super::*;
+    use crate::hash::hash_bytes;
+
+    fn jar_with_main(main: &str) -> Vec<u8> {
+        let mut w = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        w.start_file(
+            "META-INF/MANIFEST.MF",
+            zip::write::SimpleFileOptions::default(),
+        )
+        .unwrap();
+        write!(w, "Manifest-Version: 1.0\r\nMain-Class: {main}\r\n").unwrap();
+        w.finish().unwrap().into_inner()
+    }
+
+    /// An installer whose single processor, run by a fake `java`, writes `OUT` to its
+    /// `--output` argument. `declared_sha1` is what the profile claims the output hashes to.
+    fn installer(declared_sha1: &str) -> Vec<u8> {
+        let profile = json!({
+            "spec": 1, "json": "/version.json", "minecraft": "1.20.1",
+            "data": {
+                "OUT": {"client": "[x:out:1@txt]", "server": "[x:srv:1@txt]"},
+                "BLOB": {"client": "/data/client.lzma", "server": "/data/server.lzma"},
+                "LITERAL": {"client": "'lit'", "server": "'lit'"}
+            },
+            "processors": [
+                {"sides": ["server"], "jar": "x:proc:1", "args": ["--never-run-on-client"]},
+                {"jar": "x:proc:1", "classpath": [], "args": ["--output", "{OUT}", "--blob", "{BLOB}", "--mc", "{MINECRAFT_VERSION}", "--lit", "{LITERAL}", "--lib", "[x:proc:1]"],
+                 "outputs": {"{OUT}": format!("'{declared_sha1}'")}}
+            ],
+            "libraries": []
+        });
+        let version = json!({"id": "1.20.1-forge-47.2.0", "inheritsFrom": "1.20.1", "type": "release", "mainClass": "cpw.mods.bootstraplauncher.BootstrapLauncher", "libraries": []});
+        let mut w = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        let o = zip::write::SimpleFileOptions::default();
+        for (name, data) in [
+            ("install_profile.json", profile.to_string().into_bytes()),
+            ("version.json", version.to_string().into_bytes()),
+            ("data/client.lzma", b"BLOBDATA".to_vec()),
+            ("maven/x/proc/1/proc-1.jar", jar_with_main("p.Main")),
+        ] {
+            w.start_file(name, o).unwrap();
+            w.write_all(&data).unwrap();
+        }
+        w.finish().unwrap().into_inner()
+    }
+
+    /// Stand-in for `java`: records each call and writes `OUT` to the `--output` argument.
+    fn fake_java(dir: &Path) -> PathBuf {
+        let p = dir.join("fake-java.sh");
+        std::fs::write(&p, format!(
+            "#!/bin/sh\necho call >> {calls}\nwhile [ $# -gt 0 ]; do\n  case \"$1\" in --output) mkdir -p \"$(dirname \"$2\")\"; printf OUT > \"$2\";; --blob) cp \"$2\" {blob};; --lit) echo \"$2\" > {lit};; esac\n  shift\ndone\n",
+            calls = dir.join("calls").display(), blob = dir.join("blob-seen").display(), lit = dir.join("lit-seen").display()
+        )).unwrap();
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+        p
+    }
+
+    async fn serve(server: &MockServer, installer: &[u8]) {
+        let p = "/forge/net/minecraftforge/forge/1.20.1-47.2.0/forge-1.20.1-47.2.0-installer.jar";
+        Mock::given(path(p))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(installer.to_vec()))
+            .mount(server)
+            .await;
+        Mock::given(path(format!("{p}.sha1")))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_string(hash_bytes(HashAlgo::Sha1, installer)),
+            )
+            .mount(server)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn runs_the_client_processors_verifies_outputs_and_saves_the_profile() {
+        let server = MockServer::start().await;
+        let inst = installer(&hash_bytes(HashAlgo::Sha1, b"OUT"));
+        serve(&server, &inst).await;
+        let dir = tempfile::tempdir().unwrap();
+        let cache = dir.path().join("cache");
+        std::fs::create_dir_all(&cache).unwrap();
+        let c = test_client(&server.uri(), &cache);
+        let java = fake_java(dir.path());
+        let ctx = InstallContext {
+            java: &java,
+            client_jar: Path::new("/fake/client.jar"),
+        };
+
+        let p = c
+            .ensure_installed(LoaderKind::Forge, "1.20.1", "47.2.0", &ctx)
+            .await
+            .unwrap();
+        assert_eq!(p.id, "1.20.1-forge-47.2.0");
+        let calls = std::fs::read_to_string(dir.path().join("calls")).unwrap();
+        assert_eq!(
+            calls.lines().count(),
+            1,
+            "the server-only processor must not run"
+        );
+        assert_eq!(
+            std::fs::read_to_string(cache.join("libraries/x/out/1/out-1.txt")).unwrap(),
+            "OUT"
+        );
+        assert_eq!(
+            std::fs::read(dir.path().join("blob-seen")).unwrap(),
+            b"BLOBDATA",
+            "installer data files are extracted for processors"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("lit-seen"))
+                .unwrap()
+                .trim(),
+            "lit"
+        );
+        assert!(cache.join("loaders/forge-1.20.1-47.2.0.json").is_file());
+        assert!(
+            !cache.join("loaders/forge-1.20.1-47.2.0-work").exists(),
+            "scratch files are cleaned up"
+        );
+
+        // Saved profile: no more installer runs or network.
+        server.reset().await;
+        c.ensure_installed(LoaderKind::Forge, "1.20.1", "47.2.0", &ctx)
+            .await
+            .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("calls"))
+                .unwrap()
+                .lines()
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn a_processor_output_with_the_wrong_checksum_fails_the_install() {
+        let server = MockServer::start().await;
+        serve(&server, &installer(&"0".repeat(40))).await;
+        let dir = tempfile::tempdir().unwrap();
+        let cache = dir.path().join("cache");
+        std::fs::create_dir_all(&cache).unwrap();
+        let c = test_client(&server.uri(), &cache);
+        let java = fake_java(dir.path());
+        let ctx = InstallContext {
+            java: &java,
+            client_jar: Path::new("/fake/client.jar"),
+        };
+
+        let err = c
+            .ensure_installed(LoaderKind::Forge, "1.20.1", "47.2.0", &ctx)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, Error::Launch(LaunchError::LoaderInstall(m)) if m.contains("checksum")),
+            "{err:?}"
+        );
+        assert!(
+            !cache.join("loaders/forge-1.20.1-47.2.0.json").exists(),
+            "a failed install must not be saved"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_tampered_installer_is_rejected_before_anything_in_it_runs() {
+        let server = MockServer::start().await;
+        let inst = installer(&hash_bytes(HashAlgo::Sha1, b"OUT"));
+        let p = "/forge/net/minecraftforge/forge/1.20.1-47.2.0/forge-1.20.1-47.2.0-installer.jar";
+        Mock::given(path(p))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(inst))
+            .mount(&server)
+            .await;
+        Mock::given(path(format!("{p}.sha1")))
+            .respond_with(ResponseTemplate::new(200).set_body_string("1".repeat(40)))
+            .mount(&server)
+            .await;
+        let dir = tempfile::tempdir().unwrap();
+        let cache = dir.path().join("cache");
+        std::fs::create_dir_all(&cache).unwrap();
+        let c = test_client(&server.uri(), &cache);
+        let java = fake_java(dir.path());
+        let ctx = InstallContext {
+            java: &java,
+            client_jar: Path::new("/fake/client.jar"),
+        };
+
+        let err = c
+            .ensure_installed(LoaderKind::Forge, "1.20.1", "47.2.0", &ctx)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::HashMismatch { .. }), "{err:?}");
+        assert!(
+            !dir.path().join("calls").exists(),
+            "Java must never have been started"
+        );
+    }
+
+    #[test]
+    fn placeholder_substitution() {
+        let vars: HashMap<String, String> = [("A".to_string(), "1".to_string())].into();
+        let libs = tempfile::tempdir().unwrap();
+        assert_eq!(substitute("x{A}y{A}", &vars, libs.path()).unwrap(), "x1y1");
+        assert!(substitute("{NOPE}", &vars, libs.path()).is_err());
+        assert!(substitute("{A", &vars, libs.path()).is_err());
+        assert!(substitute("[a:b:1]", &vars, libs.path())
+            .unwrap()
+            .ends_with("a/b/1/b-1.jar"));
+        assert!(
+            substitute("[../../x:b:1]", &vars, libs.path()).is_err(),
+            "coordinates cannot escape the libraries folder"
+        );
+        assert_eq!(unquote("'abc'"), "abc");
+        assert_eq!(unquote("abc"), "abc");
+    }
+}
+
+<<<<<KILN-END>>>>>
+<<<<<KILN-FILE crates/kiln-core/src/loader/mod.rs>>>>>
+//! Mod loaders: Fabric and Quilt (profile JSON from their meta APIs) and Forge and NeoForge
+//! (their official installers, run headlessly by [`forge`]).
+//!
+//! A loader install produces a *profile*: a version JSON that names the vanilla version it
+//! builds on (`inheritsFrom`). It is saved under `cache/loaders/` and merged with the vanilla
+//! version at launch time. Every library is hash-checked before use.
+
+mod forge;
+
+use std::path::{Path, PathBuf};
+
+use reqwest::Method;
+use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
+
+use crate::download::Downloader;
+use crate::hash::{ExpectedHash, HashAlgo};
+use crate::launch::LaunchError;
+use crate::mojang::version::maven_path;
+use crate::mojang::{is_valid_version_id, MojangClient, VersionJson};
+use crate::net::{Body, HostPolicy, HttpClient};
+use crate::paths::SafePath;
+use crate::{Error, Result, APP_NAME, APP_VERSION};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum LoaderKind {
+    Vanilla,
+    Fabric,
+    Quilt,
+    Neoforge,
+    Forge,
+}
+
+impl LoaderKind {
+    /// The string stored in the `instances.loader` column.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Vanilla => "vanilla",
+            Self::Fabric => "fabric",
+            Self::Quilt => "quilt",
+            Self::Neoforge => "neoforge",
+            Self::Forge => "forge",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        Some(match s {
+            "vanilla" => Self::Vanilla,
+            "fabric" => Self::Fabric,
+            "quilt" => Self::Quilt,
+            "neoforge" => Self::Neoforge,
+            "forge" => Self::Forge,
+            _ => return None,
+        })
+    }
+
+    pub fn display_name(self) -> &'static str {
+        match self {
+            Self::Vanilla => "Vanilla",
+            Self::Fabric => "Fabric",
+            Self::Quilt => "Quilt",
+            Self::Neoforge => "NeoForge",
+            Self::Forge => "Forge",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct LoaderVersion {
+    pub version: String,
+    pub stable: bool,
+}
+
+/// Hosts the loader clients may contact. Library URLs inside loader profiles must be on one
+/// of these, or the download is refused.
+pub fn host_policy() -> HostPolicy {
+    HostPolicy::new(&[
+        "meta.fabricmc.net",
+        "maven.fabricmc.net",
+        "meta.quiltmc.org",
+        "maven.quiltmc.org",
+        "maven.neoforged.net",
+        "maven.minecraftforge.net",
+        "libraries.minecraft.net",
+    ])
+}
+
+#[derive(Debug, Clone)]
+pub struct Endpoints {
+    pub fabric_meta: String,
+    pub quilt_meta: String,
+    pub neoforge_maven: String,
+    pub forge_maven: String,
+}
+
+impl Default for Endpoints {
+    fn default() -> Self {
+        Self {
+            fabric_meta: "https://meta.fabricmc.net".into(),
+            quilt_meta: "https://meta.quiltmc.org".into(),
+            neoforge_maven: "https://maven.neoforged.net/releases".into(),
+            forge_maven: "https://maven.minecraftforge.net".into(),
+        }
+    }
+}
+
+/// What installers need from the rest of the launch pipeline.
+pub struct InstallContext<'a> {
+    pub java: &'a Path,
+    pub client_jar: &'a Path,
+}
+
+#[derive(Debug, Clone)]
+pub struct LoaderClient {
+    api: HttpClient,
+    downloader: Downloader,
+    mojang: MojangClient,
+    ep: Endpoints,
+}
+
+#[derive(Deserialize)]
+struct GameEntry {
+    version: String,
+}
+
+#[derive(Deserialize)]
+struct LoaderEntry {
+    loader: LoaderInner,
+}
+
+#[derive(Deserialize)]
+struct LoaderInner {
+    version: String,
+    #[serde(default)]
+    stable: Option<bool>,
+}
+
+/// Versions listed in a Maven `maven-metadata.xml`, oldest first.
+fn xml_versions(xml: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut rest = xml;
+    while let Some(start) = rest.find("<version>") {
+        let after = &rest[start + "<version>".len()..];
+        let Some(end) = after.find("</version>") else {
+            break;
+        };
+        out.push(after[..end].trim().to_owned());
+        rest = &after[end..];
+    }
+    out
+}
+
+/// NeoForge `21.1.77` is for Minecraft `1.21.1`; `21.0.x` is `1.21`. Numbering beyond the
+/// 1.x scheme isn't mapped (returns `None`).
+fn neoforge_mc_version(version: &str) -> Option<String> {
+    let mut parts = version.split('.');
+    let major: u32 = parts.next()?.parse().ok()?;
+    let minor: u32 = parts
+        .next()?
+        .chars()
+        .take_while(char::is_ascii_digit)
+        .collect::<String>()
+        .parse()
+        .ok()?;
+    if !(20..=25).contains(&major) {
+        return None;
+    }
+    Some(if minor == 0 {
+        format!("1.{major}")
+    } else {
+        format!("1.{major}.{minor}")
+    })
+}
+
+/// `1.20.1` -> 20. `None` for anything that isn't a plain `1.N[.M]` release id.
+fn mc_minor(mc: &str) -> Option<u32> {
+    let mut parts = mc.split('.');
+    (parts.next()? == "1").then_some(())?;
+    let minor = parts.next()?.parse().ok()?;
+    parts.all(|p| p.parse::<u32>().is_ok()).then_some(minor)
+}
+
+/// Forge's processor-based installers are supported from 1.17.
+const FORGE_MIN_MINOR: u32 = 17;
+
+pub(crate) fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
+    let tmp = path.with_extension("tmp");
+    std::fs::write(&tmp, bytes)?;
+    std::fs::rename(&tmp, path)?;
+    Ok(())
+}
+
+impl LoaderClient {
+    pub fn new(mojang: MojangClient, max_concurrent: u8) -> Result<Self> {
+        let ua = format!("{APP_NAME}/{APP_VERSION}");
+        Ok(Self::with_clients(
+            HttpClient::new(&ua, host_policy())?,
+            Downloader::new(
+                HttpClient::new_for_downloads(&ua, host_policy())?,
+                max_concurrent,
+            ),
+            mojang,
+            Endpoints::default(),
+        ))
+    }
+
+    pub(crate) fn with_clients(
+        api: HttpClient,
+        downloader: Downloader,
+        mojang: MojangClient,
+        ep: Endpoints,
+    ) -> Self {
+        Self {
+            api,
+            downloader,
+            mojang,
+            ep,
+        }
+    }
+
+    /// The downloader whose allowlist covers loader libraries (maven hosts).
+    pub fn downloader(&self) -> &Downloader {
+        &self.downloader
+    }
+
+    pub(crate) fn cache_dir(&self, name: &str) -> Result<PathBuf> {
+        self.mojang.cache_dir(name)
+    }
+
+    async fn get(&self, url: &str) -> Result<crate::net::HttpResponse> {
+        let resp = self
+            .api
+            .execute(Method::GET, url, Body::Empty, None)
+            .await?;
+        if resp.is_success() {
+            Ok(resp)
+        } else {
+            Err(Error::Http(format!(
+                "the server answered HTTP {}",
+                resp.status
+            )))
+        }
+    }
+
+    /// Maven publishes `<file>.sha1` next to every artifact.
+    pub(crate) async fn fetch_sha1(&self, file_url: &str) -> Result<ExpectedHash> {
+        let resp = self.get(&format!("{file_url}.sha1")).await?;
+        let text = String::from_utf8_lossy(resp.bytes());
+        let token = text.split_whitespace().next().unwrap_or("");
+        ExpectedHash::new(HashAlgo::Sha1, token)
+    }
+
+    fn meta(&self, kind: LoaderKind) -> Option<(&str, &'static str)> {
+        match kind {
+            LoaderKind::Fabric => Some((&self.ep.fabric_meta, "v2")),
+            LoaderKind::Quilt => Some((&self.ep.quilt_meta, "v3")),
+            _ => None,
+        }
+    }
+
+    /// Minecraft versions this loader supports, newest first. For vanilla, use the Mojang
+    /// manifest instead.
+    pub async fn game_versions(&self, kind: LoaderKind) -> Result<Vec<String>> {
+        if let Some((base, v)) = self.meta(kind) {
+            let list: Vec<GameEntry> = self
+                .get(&format!("{base}/{v}/versions/game"))
+                .await?
+                .json()?;
+            return Ok(list
+                .into_iter()
+                .map(|g| g.version)
+                .filter(|v| is_valid_version_id(v))
+                .collect());
+        }
+        let mut seen = Vec::new();
+        for v in self.maven_versions(kind).await? {
+            if !seen.contains(&v.0) {
+                seen.push(v.0);
+            }
+        }
+        Ok(seen)
+    }
+
+    /// Loader versions that work with `mc`, newest first.
+    pub async fn loader_versions(&self, kind: LoaderKind, mc: &str) -> Result<Vec<LoaderVersion>> {
+        if !is_valid_version_id(mc) {
+            return Err(LaunchError::InvalidVersionId.into());
+        }
+        if let Some((base, v)) = self.meta(kind) {
+            let list: Vec<LoaderEntry> = self
+                .get(&format!("{base}/{v}/versions/loader/{mc}"))
+                .await?
+                .json()?;
+            return Ok(list
+                .into_iter()
+                .map(|e| LoaderVersion {
+                    stable: e.loader.stable.unwrap_or(!e.loader.version.contains('-')),
+                    version: e.loader.version,
+                })
+                .collect());
+        }
+        Ok(self
+            .maven_versions(kind)
+            .await?
+            .into_iter()
+            .filter(|(m, _, _)| m == mc)
+            .map(|(_, version, stable)| LoaderVersion { version, stable })
+            .collect())
+    }
+
+    /// `(minecraft version, loader version, stable)` for Forge and NeoForge, newest first.
+    async fn maven_versions(&self, kind: LoaderKind) -> Result<Vec<(String, String, bool)>> {
+        let url = match kind {
+            LoaderKind::Neoforge => format!(
+                "{}/net/neoforged/neoforge/maven-metadata.xml",
+                self.ep.neoforge_maven
+            ),
+            LoaderKind::Forge => format!(
+                "{}/net/minecraftforge/forge/maven-metadata.xml",
+                self.ep.forge_maven
+            ),
+            _ => return Ok(Vec::new()),
+        };
+        let xml = self.get(&url).await?;
+        let xml = String::from_utf8_lossy(xml.bytes());
+        let mut out: Vec<_> = xml_versions(&xml)
+            .into_iter()
+            .filter_map(|v| match kind {
+                LoaderKind::Neoforge => {
+                    let stable = !v.contains('-');
+                    neoforge_mc_version(&v).map(|mc| (mc, v, stable))
+                }
+                _ => {
+                    let (mc, loader) = v.split_once('-')?;
+                    (mc_minor(mc)? >= FORGE_MIN_MINOR && is_valid_version_id(loader))
+                        .then(|| (mc.to_owned(), loader.to_owned(), true))
+                }
+            })
+            .collect();
+        out.reverse();
+        Ok(out)
+    }
+
+    /// Install (or find the saved copy of) the loader profile for `mc`, and return it.
+    /// Forge and NeoForge run their installer, which needs Java and the vanilla client jar.
+    pub async fn ensure_installed(
+        &self,
+        kind: LoaderKind,
+        mc: &str,
+        loader_version: &str,
+        ctx: &InstallContext<'_>,
+    ) -> Result<VersionJson> {
+        let key = format!("{}-{mc}-{loader_version}", kind.as_str());
+        if kind == LoaderKind::Vanilla
+            || !is_valid_version_id(&key)
+            || !is_valid_version_id(mc)
+            || !is_valid_version_id(loader_version)
+        {
+            return Err(LaunchError::InvalidVersionId.into());
+        }
+        let dest = SafePath::new(&self.cache_dir("loaders")?, &format!("{key}.json"))?;
+        if dest.as_path().is_file() {
+            return read_profile(dest.as_path(), mc);
+        }
+        let incompatible =
+            || LaunchError::IncompatibleLoader(kind.display_name().into(), mc.into());
+        match kind {
+            LoaderKind::Fabric | LoaderKind::Quilt => {
+                self.install_meta_profile(kind, mc, loader_version, &dest)
+                    .await
+            }
+            LoaderKind::Neoforge if neoforge_mc_version(loader_version).as_deref() != Some(mc) => {
+                Err(incompatible().into())
+            }
+            LoaderKind::Forge if mc_minor(mc).is_none_or(|m| m < FORGE_MIN_MINOR) => {
+                Err(incompatible().into())
+            }
+            _ => forge::install(self, kind, mc, loader_version, &key, &dest, ctx).await,
+        }
+    }
+
+    async fn install_meta_profile(
+        &self,
+        kind: LoaderKind,
+        mc: &str,
+        lv: &str,
+        dest: &SafePath,
+    ) -> Result<VersionJson> {
+        let (base, v) = self.meta(kind).ok_or(LaunchError::InvalidVersionId)?;
+        let url = format!("{base}/{v}/versions/loader/{mc}/{lv}/profile/json");
+        let resp = self
+            .api
+            .execute(Method::GET, &url, Body::Empty, None)
+            .await?;
+        match resp.status {
+            400 | 404 => {
+                return Err(
+                    LaunchError::IncompatibleLoader(kind.display_name().into(), mc.into()).into(),
+                )
+            }
+            s if !(200..300).contains(&s) => {
+                return Err(Error::Http(format!("the server answered HTTP {s}")))
+            }
+            _ => {}
+        }
+        let mut profile: Value = resp.json()?;
+        self.fill_library_downloads(&mut profile).await?;
+        let parsed: VersionJson = serde_json::from_value(profile.clone())?;
+        if parsed.inherits_from.as_deref() != Some(mc) {
+            return Err(LaunchError::LoaderInstall(
+                "the loader profile is for a different Minecraft version".into(),
+            )
+            .into());
+        }
+        write_atomic(dest.as_path(), &serde_json::to_vec(&profile)?)?;
+        Ok(parsed)
+    }
+
+    /// Loader profiles list libraries as `name` + repository `url`. Turn each into a full
+    /// download entry with the SHA-1 the repository publishes for it.
+    async fn fill_library_downloads(&self, profile: &mut Value) -> Result<()> {
+        let Some(libs) = profile.get_mut("libraries").and_then(Value::as_array_mut) else {
+            return Ok(());
+        };
+        for lib in libs {
+            if lib.get("downloads").is_some() {
+                continue;
+            }
+            let name = lib
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_owned();
+            let path =
+                maven_path(&name).ok_or_else(|| LaunchError::UnsupportedLibrary(name.clone()))?;
+            let mut base = lib
+                .get("url")
+                .and_then(Value::as_str)
+                .unwrap_or("https://libraries.minecraft.net/")
+                .to_owned();
+            if !base.ends_with('/') {
+                base.push('/');
+            }
+            let url = format!("{base}{path}");
+            let sha1 = match lib.get("sha1").and_then(Value::as_str) {
+                Some(s) => ExpectedHash::new(HashAlgo::Sha1, s)?,
+                None => self.fetch_sha1(&url).await?,
+            };
+            lib["downloads"] = json!({"artifact": {"path": path, "url": url, "sha1": sha1.hex()}});
+        }
+        Ok(())
+    }
+}
+
+fn read_profile(path: &Path, mc: &str) -> Result<VersionJson> {
+    let profile: VersionJson = serde_json::from_slice(&std::fs::read(path)?)?;
+    if profile.inherits_from.as_deref() != Some(mc) {
+        return Err(
+            LaunchError::LoaderInstall("the saved loader profile doesn't match".into()).into(),
+        );
+    }
+    Ok(profile)
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+    use wiremock::matchers::path;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    use super::*;
+    use crate::download::RetryPolicy;
+    use std::time::Duration;
+
+    pub(crate) fn test_client(server_uri: &str, cache: &Path) -> LoaderClient {
+        let policy = || HostPolicy::new(&[]).with_loopback_http();
+        let dl = || {
+            Downloader::new(HttpClient::new_for_downloads("t/0", policy()).unwrap(), 2).with_retry(
+                RetryPolicy {
+                    attempts: 2,
+                    base_delay: Duration::from_millis(1),
+                },
+            )
+        };
+        let mojang = MojangClient::with_clients(
+            HttpClient::new("t/0", policy()).unwrap(),
+            dl(),
+            cache,
+            format!("{server_uri}/manifest.json"),
+            format!("{server_uri}/assets/"),
+        );
+        LoaderClient::with_clients(
+            HttpClient::new("t/0", policy()).unwrap(),
+            dl(),
+            mojang,
+            Endpoints {
+                fabric_meta: server_uri.into(),
+                quilt_meta: format!("{server_uri}/quilt"),
+                neoforge_maven: format!("{server_uri}/neo"),
+                forge_maven: format!("{server_uri}/forge"),
+            },
+        )
+    }
+
+    async fn json_at(server: &MockServer, p: &str, v: serde_json::Value) {
+        Mock::given(path(p.to_owned()))
+            .respond_with(ResponseTemplate::new(200).set_body_json(v))
+            .mount(server)
+            .await;
+    }
+
+    #[test]
+    fn kinds_round_trip_the_database_strings() {
+        for k in [
+            LoaderKind::Vanilla,
+            LoaderKind::Fabric,
+            LoaderKind::Quilt,
+            LoaderKind::Neoforge,
+            LoaderKind::Forge,
+        ] {
+            assert_eq!(LoaderKind::parse(k.as_str()), Some(k));
+        }
+        assert_eq!(LoaderKind::parse("optifine"), None);
+    }
+
+    #[test]
+    fn version_mapping_helpers() {
+        assert_eq!(neoforge_mc_version("21.1.77").as_deref(), Some("1.21.1"));
+        assert_eq!(neoforge_mc_version("21.0.5-beta").as_deref(), Some("1.21"));
+        assert_eq!(neoforge_mc_version("20.4.237").as_deref(), Some("1.20.4"));
+        assert_eq!(
+            neoforge_mc_version("47.1.0"),
+            None,
+            "legacy Forge numbering"
+        );
+        assert_eq!(
+            neoforge_mc_version("26.1.0.0"),
+            None,
+            "beyond the 1.x scheme"
+        );
+        assert_eq!(mc_minor("1.20.1"), Some(20));
+        assert_eq!(mc_minor("1.21"), Some(21));
+        assert_eq!(mc_minor("24w14a"), None);
+        assert_eq!(mc_minor("1.7.10_pre4"), None);
+        assert_eq!(
+            xml_versions("<versions><version>1.0</version>\n<version> 2.0 </version></versions>"),
+            ["1.0", "2.0"]
+        );
+    }
+
+    #[tokio::test]
+    async fn fabric_lists_versions_for_the_picker() {
+        let server = MockServer::start().await;
+        json_at(
+            &server,
+            "/v2/versions/game",
+            json!([{"version": "1.21.1", "stable": true}, {"version": "../evil"}]),
+        )
+        .await;
+        json_at(&server, "/v2/versions/loader/1.21.1", json!([
+            {"loader": {"version": "0.16.5", "stable": true}}, {"loader": {"version": "0.17.0-beta.1", "stable": false}}
+        ])).await;
+        json_at(
+            &server,
+            "/quilt/v3/versions/loader/1.21.1",
+            json!([{"loader": {"version": "0.26.4"}}, {"loader": {"version": "0.27.0-beta.1"}}]),
+        )
+        .await;
+        let dir = tempfile::tempdir().unwrap();
+        let c = test_client(&server.uri(), dir.path());
+
+        assert_eq!(
+            c.game_versions(LoaderKind::Fabric).await.unwrap(),
+            ["1.21.1"],
+            "unsafe ids are dropped"
+        );
+        let v = c
+            .loader_versions(LoaderKind::Fabric, "1.21.1")
+            .await
+            .unwrap();
+        assert_eq!(
+            v,
+            [
+                LoaderVersion {
+                    version: "0.16.5".into(),
+                    stable: true
+                },
+                LoaderVersion {
+                    version: "0.17.0-beta.1".into(),
+                    stable: false
+                }
+            ]
+        );
+        let q = c
+            .loader_versions(LoaderKind::Quilt, "1.21.1")
+            .await
+            .unwrap();
+        assert_eq!(
+            (q[0].stable, q[1].stable),
+            (true, false),
+            "Quilt has no stable flag: betas are inferred"
+        );
+        assert!(c.loader_versions(LoaderKind::Fabric, "../x").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn forge_and_neoforge_list_only_compatible_combinations() {
+        let server = MockServer::start().await;
+        Mock::given(path("/forge/net/minecraftforge/forge/maven-metadata.xml")).respond_with(ResponseTemplate::new(200).set_body_string(
+            "<metadata><versioning><versions><version>1.12.2-14.23.5.2860</version><version>1.20.1-47.2.0</version><version>1.20.1-47.3.0</version><version>1.21-51.0.1</version></versions></versioning></metadata>")).mount(&server).await;
+        Mock::given(path("/neo/net/neoforged/neoforge/maven-metadata.xml")).respond_with(ResponseTemplate::new(200).set_body_string(
+            "<metadata><versioning><versions><version>20.4.1</version><version>21.1.77</version><version>21.1.78-beta</version><version>26.1.0.0</version></versions></versioning></metadata>")).mount(&server).await;
+        let dir = tempfile::tempdir().unwrap();
+        let c = test_client(&server.uri(), dir.path());
+
+        assert_eq!(
+            c.game_versions(LoaderKind::Forge).await.unwrap(),
+            ["1.21", "1.20.1"],
+            "1.12.2 is hidden"
+        );
+        let v = c
+            .loader_versions(LoaderKind::Forge, "1.20.1")
+            .await
+            .unwrap();
+        assert_eq!(
+            v.iter().map(|x| x.version.as_str()).collect::<Vec<_>>(),
+            ["47.3.0", "47.2.0"],
+            "newest first"
+        );
+        assert!(c
+            .loader_versions(LoaderKind::Forge, "1.12.2")
+            .await
+            .unwrap()
+            .is_empty());
+        let n = c
+            .loader_versions(LoaderKind::Neoforge, "1.21.1")
+            .await
+            .unwrap();
+        assert_eq!(
+            (n[0].version.as_str(), n[0].stable, n[1].stable),
+            ("21.1.78-beta", false, true)
+        );
+        assert!(c
+            .loader_versions(LoaderKind::Neoforge, "1.19.2")
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn fabric_profiles_get_verified_download_entries_and_are_saved() {
+        let server = MockServer::start().await;
+        let s = server.uri();
+        json_at(&server, "/v2/versions/loader/1.21.1/0.16.5/profile/json", json!({
+            "id": "fabric-loader-0.16.5-1.21.1", "inheritsFrom": "1.21.1", "type": "release",
+            "mainClass": "net.fabricmc.loader.impl.launch.knot.KnotClient",
+            "arguments": {"game": [], "jvm": ["-DFabricMcEmu= net.minecraft.client.main.Main "]},
+            "libraries": [
+                {"name": "net.fabricmc:fabric-loader:0.16.5", "url": format!("{s}/maven/")},
+                {"name": "net.fabricmc:with-hash:1", "url": format!("{s}/maven"), "sha1": "c".repeat(40)}
+            ]
+        })).await;
+        Mock::given(path(
+            "/maven/net/fabricmc/fabric-loader/0.16.5/fabric-loader-0.16.5.jar.sha1",
+        ))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string(format!("{}  fabric-loader-0.16.5.jar\n", "a".repeat(40))),
+        )
+        .mount(&server)
+        .await;
+        let dir = tempfile::tempdir().unwrap();
+        let c = test_client(&s, dir.path());
+        let ctx = InstallContext {
+            java: Path::new("/nonexistent"),
+            client_jar: Path::new("/nonexistent"),
+        };
+
+        let p = c
+            .ensure_installed(LoaderKind::Fabric, "1.21.1", "0.16.5", &ctx)
+            .await
+            .unwrap();
+        assert_eq!(
+            p.main_class,
+            "net.fabricmc.loader.impl.launch.knot.KnotClient"
+        );
+        let libs = p
+            .resolve_libraries(&crate::mojang::rules::Environment::current())
+            .unwrap()
+            .classpath;
+        assert_eq!(
+            libs[0].path,
+            "net/fabricmc/fabric-loader/0.16.5/fabric-loader-0.16.5.jar"
+        );
+        assert_eq!(
+            libs[0].sha1,
+            "a".repeat(40),
+            "taken from the repository's .sha1 file"
+        );
+        assert_eq!(libs[1].sha1, "c".repeat(40));
+        assert_eq!(
+            libs[1].url,
+            format!("{s}/maven/net/fabricmc/with-hash/1/with-hash-1.jar")
+        );
+
+        // Saved: a second call needs no network at all.
+        server.reset().await;
+        let again = c
+            .ensure_installed(LoaderKind::Fabric, "1.21.1", "0.16.5", &ctx)
+            .await
+            .unwrap();
+        assert_eq!(again.id, p.id);
+    }
+
+    #[tokio::test]
+    async fn an_unknown_loader_version_is_reported_as_incompatible() {
+        let server = MockServer::start().await;
+        Mock::given(path("/v2/versions/loader/1.21.1/9.9.9/profile/json"))
+            .respond_with(ResponseTemplate::new(400))
+            .mount(&server)
+            .await;
+        let dir = tempfile::tempdir().unwrap();
+        let c = test_client(&server.uri(), dir.path());
+        let ctx = InstallContext {
+            java: Path::new("/x"),
+            client_jar: Path::new("/x"),
+        };
+        let err = c
+            .ensure_installed(LoaderKind::Fabric, "1.21.1", "9.9.9", &ctx)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, Error::Launch(LaunchError::IncompatibleLoader(..))),
+            "{err:?}"
+        );
+        for (kind, mc, lv) in [
+            (LoaderKind::Forge, "1.12.2", "14.23.5.2860"),
+            (LoaderKind::Neoforge, "1.21.1", "20.4.1"),
+            (LoaderKind::Vanilla, "1.21.1", "1"),
+        ] {
+            assert!(
+                c.ensure_installed(kind, mc, lv, &ctx).await.is_err(),
+                "{kind:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_profile_for_the_wrong_minecraft_version_is_rejected_and_not_saved() {
+        let server = MockServer::start().await;
+        json_at(&server, "/v2/versions/loader/1.21.1/0.16.5/profile/json", json!({
+            "id": "x", "inheritsFrom": "1.20.4", "type": "release", "mainClass": "M", "libraries": []
+        })).await;
+        let dir = tempfile::tempdir().unwrap();
+        let c = test_client(&server.uri(), dir.path());
+        let ctx = InstallContext {
+            java: Path::new("/x"),
+            client_jar: Path::new("/x"),
+        };
+        assert!(c
+            .ensure_installed(LoaderKind::Fabric, "1.21.1", "0.16.5", &ctx)
+            .await
+            .is_err());
+        assert!(!dir
+            .path()
+            .join("loaders/fabric-1.21.1-0.16.5.json")
+            .exists());
+    }
+}
+
+<<<<<KILN-END>>>>>
